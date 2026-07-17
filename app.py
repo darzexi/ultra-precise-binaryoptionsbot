@@ -6,6 +6,7 @@ import queue
 import os
 import random
 import logging
+import sys
 from datetime import datetime, timedelta
 from flask import Flask, render_template_string, request, jsonify
 import numpy as np
@@ -60,14 +61,14 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 
-# HTML Template with debug info
+# HTML Template
 HTML_TEMPLATE = '''
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>PocketOption Signal Bot - 100% Real-time</title>
+    <title>PocketOption Signal Bot</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
@@ -610,27 +611,29 @@ HTML_TEMPLATE = '''
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(config)
             })
-            .then(response => {
-                if (!response.ok) throw new Error('HTTP ' + response.status);
-                return response.json();
-            })
-            .then(data => {
-                if (data.success) {
-                    isRunning = true;
-                    updateUI(true);
-                    startPolling();
-                    addLog('✅ Bot started successfully!', 'precise');
-                    ssidStatus.textContent = 'Set ✓';
-                    ssidStatus.style.color = '#28a745';
-                    signalQuality.textContent = '100% Real-time';
-                    signalQuality.style.color = '#28a745';
-                    addLog('⏳ Waiting for first price update...', 'info');
-                } else {
-                    addLog('❌ Failed to start: ' + (data.error || 'Unknown error'), 'error');
+            .then(response => response.text())
+            .then(text => {
+                try {
+                    const data = JSON.parse(text);
+                    if (data.success) {
+                        isRunning = true;
+                        updateUI(true);
+                        startPolling();
+                        addLog('✅ Bot started successfully!', 'precise');
+                        ssidStatus.textContent = 'Set ✓';
+                        ssidStatus.style.color = '#28a745';
+                        signalQuality.textContent = '100% Real-time';
+                        signalQuality.style.color = '#28a745';
+                        addLog('⏳ Waiting for first price update...', 'info');
+                    } else {
+                        addLog('❌ Failed to start: ' + (data.error || 'Unknown error'), 'error');
+                    }
+                } catch (e) {
+                    addLog('❌ Server error: ' + text.substring(0, 100), 'error');
                 }
             })
             .catch(err => {
-                addLog('❌ Start error: ' + err.message, 'error');
+                addLog('❌ Network error: ' + err.message, 'error');
             });
         });
 
@@ -741,113 +744,126 @@ def index():
 def start_bot():
     global signal_thread, signal_data, trading_client
     
-    with update_lock:
-        if signal_data['is_running']:
-            return jsonify({'success': False, 'error': 'Bot already running'})
-        
-        config = request.json
-        if not config:
-            return jsonify({'success': False, 'error': 'No configuration provided'})
-        
-        ssid = config.get('ssid', '').strip()
-        if not ssid:
-            return jsonify({'success': False, 'error': 'SSID is required'})
-        
-        trade_exp = int(config.get('trade_expiration', 60))
-        if trade_exp < 3:
-            trade_exp = 3
-        
-        signal_data.update({
-            'ssid': ssid,
-            'asset': config.get('asset', 'EURUSD_otc'),
-            'timeframe': int(config.get('timeframe', 60)),
-            'update_rate': float(config.get('update_rate', 0.5)),
-            'manual_mode': config.get('manual_mode', False),
-            'websocket_mode': config.get('websocket_mode', True),
-            'hotkey': config.get('hotkey', 'space'),
-            'is_running': True,
-            'current_signal': 'pending',
-            'last_update': None,
-            'use_expiration': config.get('use_expiration', False),
-            'trade_expiration': trade_exp,
-            'candle_progress': 0,
-            'candle_high': None,
-            'candle_low': None,
-            'candle_open': None,
-            'candle_start_time': None,
-            'manual_triggered': False,
-            'candle_time_remaining': '--',
-            'signal_count': 0
-        })
-        
-        while not signal_queue.empty():
-            try:
-                signal_queue.get_nowait()
-            except:
-                break
-        
-        signal_thread = threading.Thread(target=run_signal_bot, daemon=True)
-        signal_thread.start()
-        
-        return jsonify({'success': True})
+    try:
+        with update_lock:
+            if signal_data['is_running']:
+                return jsonify({'success': False, 'error': 'Bot already running'})
+            
+            config = request.json
+            if not config:
+                return jsonify({'success': False, 'error': 'No configuration provided'})
+            
+            ssid = config.get('ssid', '').strip()
+            if not ssid:
+                return jsonify({'success': False, 'error': 'SSID is required'})
+            
+            trade_exp = int(config.get('trade_expiration', 60))
+            if trade_exp < 3:
+                trade_exp = 3
+            
+            signal_data.update({
+                'ssid': ssid,
+                'asset': config.get('asset', 'EURUSD_otc'),
+                'timeframe': int(config.get('timeframe', 60)),
+                'update_rate': float(config.get('update_rate', 0.5)),
+                'manual_mode': config.get('manual_mode', False),
+                'websocket_mode': config.get('websocket_mode', True),
+                'hotkey': config.get('hotkey', 'space'),
+                'is_running': True,
+                'current_signal': 'pending',
+                'last_update': None,
+                'use_expiration': config.get('use_expiration', False),
+                'trade_expiration': trade_exp,
+                'candle_progress': 0,
+                'candle_high': None,
+                'candle_low': None,
+                'candle_open': None,
+                'candle_start_time': None,
+                'manual_triggered': False,
+                'candle_time_remaining': '--',
+                'signal_count': 0
+            })
+            
+            while not signal_queue.empty():
+                try:
+                    signal_queue.get_nowait()
+                except:
+                    break
+            
+            signal_thread = threading.Thread(target=run_signal_bot, daemon=True)
+            signal_thread.start()
+            
+            return jsonify({'success': True})
+    except Exception as e:
+        logging.error(f"Start error: {e}")
+        return jsonify({'success': False, 'error': str(e)})
 
 @app.route('/stop', methods=['POST'])
 def stop_bot():
     global signal_data, trading_client
     
-    with update_lock:
-        signal_data['is_running'] = False
-        trading_client = None
-        return jsonify({'success': True})
+    try:
+        with update_lock:
+            signal_data['is_running'] = False
+            trading_client = None
+            return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)})
 
 @app.route('/manual_signal', methods=['POST', 'OPTIONS'])
 def manual_signal():
     if request.method == 'OPTIONS':
         return jsonify({'success': True})
     
-    with update_lock:
-        if not signal_data['is_running']:
-            return jsonify({'success': False, 'error': 'Bot not running'})
-        if not signal_data['manual_mode']:
-            return jsonify({'success': False, 'error': 'Manual mode not enabled'})
-        
-        current_price = signal_data.get('price_data', 1.2000)
-        open_price = signal_data.get('candle_open', current_price)
-        
-        if current_price and open_price and current_price > open_price:
-            signal = 'buy'
-        elif current_price and open_price and current_price < open_price:
-            signal = 'sell'
-        else:
-            signal = 'buy' if int(time.time()) % 2 == 0 else 'sell'
-        
-        signal_data['current_signal'] = signal
-        signal_data['manual_triggered'] = True
-        signal_data['last_update'] = datetime.now().strftime('%H:%M:%S.%f')[:-3]
-        signal_data['signal_count'] = signal_data.get('signal_count', 0) + 1
-        
-        return jsonify({'success': True, 'signal': signal, 'price': current_price})
+    try:
+        with update_lock:
+            if not signal_data['is_running']:
+                return jsonify({'success': False, 'error': 'Bot not running'})
+            if not signal_data['manual_mode']:
+                return jsonify({'success': False, 'error': 'Manual mode not enabled'})
+            
+            current_price = signal_data.get('price_data', 1.2000)
+            open_price = signal_data.get('candle_open', current_price)
+            
+            if current_price and open_price and current_price > open_price:
+                signal = 'buy'
+            elif current_price and open_price and current_price < open_price:
+                signal = 'sell'
+            else:
+                signal = 'buy' if int(time.time()) % 2 == 0 else 'sell'
+            
+            signal_data['current_signal'] = signal
+            signal_data['manual_triggered'] = True
+            signal_data['last_update'] = datetime.now().strftime('%H:%M:%S.%f')[:-3]
+            signal_data['signal_count'] = signal_data.get('signal_count', 0) + 1
+            
+            return jsonify({'success': True, 'signal': signal, 'price': current_price})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)})
 
 @app.route('/get_signal')
 def get_signal():
-    with update_lock:
-        return jsonify({
-            'signal': signal_data.get('current_signal'),
-            'price': signal_data.get('price_data'),
-            'timestamp': signal_data.get('last_update'),
-            'manual_triggered': signal_data.get('manual_triggered', False),
-            'use_expiration': signal_data.get('use_expiration', False),
-            'trade_expiration': signal_data.get('trade_expiration', 60),
-            'signal_count': signal_data.get('signal_count', 0),
-            'candle_data': {
-                'progress': signal_data.get('candle_progress', 0),
-                'open': signal_data.get('candle_open'),
-                'high': signal_data.get('candle_high'),
-                'low': signal_data.get('candle_low'),
-                'current': signal_data.get('price_data'),
-                'time_remaining': signal_data.get('candle_time_remaining', '--')
-            }
-        })
+    try:
+        with update_lock:
+            return jsonify({
+                'signal': signal_data.get('current_signal'),
+                'price': signal_data.get('price_data'),
+                'timestamp': signal_data.get('last_update'),
+                'manual_triggered': signal_data.get('manual_triggered', False),
+                'use_expiration': signal_data.get('use_expiration', False),
+                'trade_expiration': signal_data.get('trade_expiration', 60),
+                'signal_count': signal_data.get('signal_count', 0),
+                'candle_data': {
+                    'progress': signal_data.get('candle_progress', 0),
+                    'open': signal_data.get('candle_open'),
+                    'high': signal_data.get('candle_high'),
+                    'low': signal_data.get('candle_low'),
+                    'current': signal_data.get('price_data'),
+                    'time_remaining': signal_data.get('candle_time_remaining', '--')
+                }
+            })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 def run_signal_bot():
     global signal_data, trading_client
@@ -877,35 +893,29 @@ def run_signal_bot():
         try:
             current_time = time.time()
             
-            # Update on first run or based on update rate
             if first_run or (current_time - last_signal_time >= signal_data['update_rate']):
                 first_run = False
                 
-                # Get price
                 price_data = fetch_current_price()
                 if price_data:
                     current_price = price_data.get('price', 0)
                     
-                    # Initialize candle
                     if candle_open_price is None:
                         candle_open_price = current_price
                         candle_high_price = current_price
                         candle_low_price = current_price
                         candle_start_time = current_time
-                        logging.info(f"Candle initialized at price: {current_price}")
+                        logging.info(f"Candle initialized at {current_price}")
                     
-                    # Update high/low
                     if current_price > candle_high_price:
                         candle_high_price = current_price
                     if current_price < candle_low_price:
                         candle_low_price = current_price
                     
-                    # Calculate progress
                     timeframe = signal_data['timeframe']
                     elapsed = current_time - candle_start_time
                     progress = min((elapsed / timeframe) * 100, 100)
                     
-                    # New candle
                     if elapsed >= timeframe:
                         candle_open_price = current_price
                         candle_high_price = current_price
@@ -922,15 +932,10 @@ def run_signal_bot():
                         })
                         if len(current_candle_data) > 50:
                             current_candle_data.pop(0)
-                        logging.info(f"New candle at: {current_price}")
                     
-                    # Generate signal
-                    signal = generate_signal_from_candle(
-                        current_price, candle_open_price, candle_high_price, 
-                        candle_low_price, progress, current_candle_data
-                    )
+                    signal = generate_signal(current_price, candle_open_price, candle_high_price, 
+                                            candle_low_price, progress, current_candle_data)
                     
-                    # Update global data
                     with update_lock:
                         signal_data['price_data'] = current_price
                         signal_data['candle_open'] = candle_open_price
@@ -943,13 +948,12 @@ def run_signal_bot():
                             signal_data['current_signal'] = signal
                             signal_data['last_update'] = datetime.now().strftime('%H:%M:%S.%f')[:-3]
                             signal_data['signal_count'] = signal_data.get('signal_count', 0) + 1
-                            logging.info(f"Signal generated: {signal} at {current_price}")
+                            logging.info(f"Signal: {signal} at {current_price}")
                         elif not signal_data.get('current_signal') or signal_data.get('current_signal') == 'pending':
-                            # Set a default signal if none exists
+                            # Fallback signal
                             signal_data['current_signal'] = 'buy' if int(time.time()) % 2 == 0 else 'sell'
                             signal_data['last_update'] = datetime.now().strftime('%H:%M:%S.%f')[:-3]
                             signal_data['signal_count'] = signal_data.get('signal_count', 0) + 1
-                            logging.info(f"Default signal set: {signal_data['current_signal']}")
                 
                 last_signal_time = current_time
             
@@ -961,11 +965,10 @@ def run_signal_bot():
     
     logging.info("Signal bot thread stopped")
 
-def generate_signal_from_candle(current_price, open_price, high_price, low_price, progress, candle_history):
+def generate_signal(current_price, open_price, high_price, low_price, progress, candle_history):
     if open_price is None:
         return 'buy' if int(time.time()) % 2 == 0 else 'sell'
     
-    # Check expiration
     if signal_data.get('use_expiration', False):
         trade_exp = signal_data.get('trade_expiration', 60)
         timeframe = signal_data['timeframe']
@@ -973,7 +976,6 @@ def generate_signal_from_candle(current_price, open_price, high_price, low_price
         if remaining < trade_exp:
             return 'hold'
     
-    # Early candle - look at previous close
     if progress < 10 and len(candle_history) >= 2:
         prev_close = candle_history[-2].get('close', current_price)
         if current_price > prev_close:
@@ -981,13 +983,11 @@ def generate_signal_from_candle(current_price, open_price, high_price, low_price
         elif current_price < prev_close:
             return 'sell'
     
-    # Strong momentum
     if high_price and open_price and high_price > open_price * 1.002 and current_price > open_price:
         return 'buy'
     elif low_price and open_price and low_price < open_price * 0.998 and current_price < open_price:
         return 'sell'
     
-    # Breakout
     if len(candle_history) >= 3:
         prev_candle = candle_history[-2]
         if prev_candle and current_price > prev_candle.get('high', 0):
@@ -995,7 +995,6 @@ def generate_signal_from_candle(current_price, open_price, high_price, low_price
         if prev_candle and current_price < prev_candle.get('low', 0):
             return 'sell'
     
-    # Simple trend
     if current_price > open_price:
         return 'buy'
     elif current_price < open_price:
@@ -1015,7 +1014,7 @@ def fetch_current_price():
         if price:
             return {'price': price, 'timestamp': time.time()}
     except Exception as e:
-        logging.debug(f"Price fetch failed, using mock: {e}")
+        logging.debug(f"Price fetch failed: {e}")
     
     return generate_mock_price()
 
