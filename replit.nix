@@ -1,6 +1,6 @@
 { pkgs }: {
   deps = [
-    pkgs.python39
-    pkgs.python39Packages.pip
+    pkgs.python310
+    pkgs.python310Packages.pip
   ];
 }
