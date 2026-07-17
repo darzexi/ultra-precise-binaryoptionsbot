@@ -7,10 +7,9 @@ import os
 import random
 import numpy as np
 from datetime import datetime, timedelta
-from flask import Flask, render_template_string, request, jsonify
+from flask import Flask, render_template_string, request, jsonify, after_this_request
 from BinaryOptionsToolsV2.pocketoption import PocketOptionAsync
 import logging
-import sys
 
 # Initialize Flask app
 app = Flask(__name__)
@@ -45,15 +44,13 @@ signal_data = {
     'candle_low': None,
     'candle_open': None,
     'candle_start_time': None,
-    'manual_triggered': False,
-    'candle_time_remaining': '--'
+    'manual_triggered': False
 }
 
 trading_client = None
 signal_thread = None
 signal_queue = queue.Queue()
 update_lock = threading.Lock()
-loop = None
 
 # HTML template with fixed JavaScript - MANUAL MODE COMPLETELY FIXED
 HTML_TEMPLATE = '''
@@ -895,7 +892,7 @@ def index():
 
 @app.route('/start', methods=['POST'])
 def start_bot():
-    global signal_thread, signal_data, trading_client, loop
+    global signal_thread, signal_data, trading_client
     
     with update_lock:
         if signal_data['is_running']:
@@ -931,8 +928,7 @@ def start_bot():
             'candle_low': None,
             'candle_open': None,
             'candle_start_time': None,
-            'manual_triggered': False,
-            'candle_time_remaining': '--'
+            'manual_triggered': False
         })
         
         while not signal_queue.empty():
@@ -941,10 +937,6 @@ def start_bot():
             except:
                 break
         
-        # Create new event loop for the thread
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        
         signal_thread = threading.Thread(target=run_signal_bot, daemon=True)
         signal_thread.start()
         
@@ -952,15 +944,15 @@ def start_bot():
 
 @app.route('/stop', methods=['POST'])
 def stop_bot():
-    global signal_data, trading_client, loop
+    global signal_data
     
     with update_lock:
         signal_data['is_running'] = False
         
+        global trading_client
         if trading_client:
             try:
-                if loop and not loop.is_closed():
-                    loop.call_soon_threadsafe(loop.stop)
+                pass
             except:
                 pass
             trading_client = None
@@ -971,6 +963,7 @@ def stop_bot():
 def manual_signal():
     global signal_data
     
+    # Handle OPTIONS request for CORS
     if request.method == 'OPTIONS':
         return jsonify({'success': True})
     
@@ -980,16 +973,19 @@ def manual_signal():
     if not signal_data['manual_mode']:
         return jsonify({'success': False, 'error': 'Manual mode not enabled'})
     
+    # Get current price
     current_price = signal_data.get('price_data')
     if current_price is None:
         price_data = fetch_current_price()
         if price_data:
             current_price = price_data.get('price')
     
+    # Get candle data
     open_price = signal_data.get('candle_open')
     if open_price is None:
         open_price = current_price if current_price else 1.2000
     
+    # Generate manual signal immediately
     if current_price and open_price:
         if current_price > open_price:
             signal = 'buy'
@@ -1001,6 +997,7 @@ def manual_signal():
         signal = 'buy' if int(time.time()) % 2 == 0 else 'sell'
         current_price = 1.2000
     
+    # Update signal data with manual signal
     with update_lock:
         signal_data['current_signal'] = signal
         signal_data['price_data'] = current_price
@@ -1042,7 +1039,7 @@ def get_signal():
         return jsonify(response)
 
 def run_signal_bot():
-    global signal_data, trading_client, signal_queue, loop
+    global signal_data, trading_client, signal_queue
     
     logging.info("Signal bot thread started")
     
@@ -1052,11 +1049,7 @@ def run_signal_bot():
         return
     
     try:
-        # Run async initialization in the thread's event loop
-        async def init_client():
-            return PocketOptionAsync(ssid=ssid)
-        
-        trading_client = loop.run_until_complete(init_client())
+        trading_client = PocketOptionAsync(ssid=ssid)
         logging.info("PocketOption client initialized")
     except Exception as e:
         logging.error(f"Failed to initialize client: {e}")
@@ -1208,7 +1201,7 @@ def generate_signal_from_candle(current_price, open_price, high_price, low_price
             return {'signal': 'sell', 'price': current_price}
 
 def fetch_current_price():
-    global trading_client, signal_data, loop
+    global trading_client, signal_data
     
     if trading_client is None:
         return generate_mock_price()
@@ -1218,20 +1211,14 @@ def fetch_current_price():
         
         try:
             if hasattr(trading_client, 'get_current_price'):
-                async def get_price():
-                    return await trading_client.get_current_price(asset)
-                
-                price = loop.run_until_complete(get_price())
+                price = asyncio.run(trading_client.get_current_price(asset))
                 if price:
                     return {'price': price, 'timestamp': time.time()}
         except:
             pass
         
         try:
-            async def get_candles():
-                return await trading_client.get_candles(asset, 1, 1)
-            
-            candles = loop.run_until_complete(get_candles())
+            candles = asyncio.run(trading_client.get_candles(asset, 1, 1))
             if candles and len(candles) > 0:
                 latest = candles[-1]
                 return {
@@ -1242,10 +1229,7 @@ def fetch_current_price():
             pass
         
         try:
-            async def get_history():
-                return await trading_client.history(asset, 1)
-            
-            history = loop.run_until_complete(get_history())
+            history = asyncio.run(trading_client.history(asset, 1))
             if history and len(history) > 0:
                 latest = history[-1]
                 return {
@@ -1287,9 +1271,4 @@ if __name__ == '__main__':
     print("6. Manual Mode: Enable and use hotkey or button for manual signals")
     print("="*50 + "\n")
     
-    # Use waitress for production
-    try:
-        from waitress import serve
-        serve(app, host='0.0.0.0', port=5000, threads=2)
-    except ImportError:
-        app.run(host='0.0.0.0', port=5000, debug=False, threaded=False)
+    app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
