@@ -44,7 +44,9 @@ signal_data = {
     'candle_low': None,
     'candle_open': None,
     'candle_start_time': None,
-    'manual_triggered': False
+    'manual_triggered': False,
+    'connection_status': 'disconnected',
+    'retry_count': 0
 }
 
 trading_client = None
@@ -55,7 +57,7 @@ loop = None
 client_initialized = False
 client_init_lock = threading.Lock()
 
-# HTML template (keeping it concise for the response)
+# HTML Template (same as before - keeping it concise)
 HTML_TEMPLATE = '''
 <!DOCTYPE html>
 <html lang="en">
@@ -364,6 +366,16 @@ HTML_TEMPLATE = '''
         .candle-high { color: #28a745; }
         .candle-low { color: #dc3545; }
         .candle-open { color: #ffc107; }
+        .status-dot {
+            display: inline-block;
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            margin-right: 5px;
+        }
+        .status-dot.connected { background: #28a745; }
+        .status-dot.connecting { background: #ffc107; }
+        .status-dot.disconnected { background: #dc3545; }
     </style>
 </head>
 <body>
@@ -480,6 +492,10 @@ HTML_TEMPLATE = '''
                 <span id="statusText">Stopped</span>
             </div>
             <div class="status-item">
+                <span>Connection:</span>
+                <span id="connectionStatus"><span class="status-dot disconnected"></span>Disconnected</span>
+            </div>
+            <div class="status-item">
                 <span>Hotkey:</span>
                 <span id="hotkeyDisplay"><span class="hotkey-indicator">space</span></span>
             </div>
@@ -522,6 +538,7 @@ HTML_TEMPLATE = '''
         const signalPrice = document.getElementById('signalPrice');
         const signalTime = document.getElementById('signalTime');
         const statusText = document.getElementById('statusText');
+        const connectionStatus = document.getElementById('connectionStatus');
         const modeDisplay = document.getElementById('modeDisplay');
         const dataSourceDisplay = document.getElementById('dataSourceDisplay');
         const hotkeyDisplay = document.getElementById('hotkeyDisplay');
@@ -752,6 +769,7 @@ HTML_TEMPLATE = '''
                 signalTime.textContent = 'Last Update: --';
                 signalQuality.textContent = '100% Real-time';
                 signalQuality.style.color = '#28a745';
+                updateConnectionStatus('disconnected');
                 
                 candleProgressFill.style.width = '0%';
                 candleProgressText.textContent = '0%';
@@ -761,6 +779,12 @@ HTML_TEMPLATE = '''
                 candleCurrent.textContent = '--';
                 candleTimeRemaining.textContent = '--';
             }
+        }
+
+        function updateConnectionStatus(status) {
+            const dotClass = status === 'connected' ? 'connected' : status === 'connecting' ? 'connecting' : 'disconnected';
+            const statusText = status.charAt(0).toUpperCase() + status.slice(1);
+            connectionStatus.innerHTML = `<span class="status-dot ${dotClass}"></span>${statusText}`;
         }
 
         manualMode.addEventListener('change', function() {
@@ -789,6 +813,9 @@ HTML_TEMPLATE = '''
                         }
                         if (data.candle_data) {
                             updateCandleDisplay(data.candle_data);
+                        }
+                        if (data.connection_status) {
+                            updateConnectionStatus(data.connection_status);
                         }
                     })
                     .catch(err => console.error('Polling error:', err));
@@ -883,6 +910,7 @@ HTML_TEMPLATE = '''
         addLog('Minimum trade expiration: 3 seconds', 'info');
         ssidStatus.textContent = 'Not Set';
         ssidStatus.style.color = '#dc3545';
+        updateConnectionStatus('disconnected');
     </script>
 </body>
 </html>
@@ -931,7 +959,9 @@ def start_bot():
             'candle_low': None,
             'candle_open': None,
             'candle_start_time': None,
-            'manual_triggered': False
+            'manual_triggered': False,
+            'connection_status': 'connecting',
+            'retry_count': 0
         })
         
         while not signal_queue.empty():
@@ -950,15 +980,40 @@ def start_bot():
                 loop = None
                 return jsonify({'success': False, 'error': f'Failed to create event loop: {e}'})
         
-        # Initialize client before starting thread
+        # Try to initialize client with retry
         try:
             with client_init_lock:
-                trading_client = PocketOptionAsync(ssid=ssid)
-                client_initialized = True
-                logging.info("PocketOption client initialized successfully")
+                # Attempt to connect with timeout
+                import concurrent.futures
+                
+                def init_client():
+                    try:
+                        return PocketOptionAsync(ssid=ssid)
+                    except Exception as e:
+                        logging.error(f"Client init error: {e}")
+                        raise
+                
+                # Use ThreadPoolExecutor with timeout
+                with concurrent.futures.ThreadPoolExecutor() as executor:
+                    future = executor.submit(init_client)
+                    try:
+                        trading_client = future.result(timeout=30)  # 30 second timeout
+                        client_initialized = True
+                        signal_data['connection_status'] = 'connected'
+                        logging.info("PocketOption client initialized successfully")
+                    except concurrent.futures.TimeoutError:
+                        logging.error("Client initialization timed out")
+                        signal_data['connection_status'] = 'disconnected'
+                        return jsonify({'success': False, 'error': 'Connection timeout. Please check your SSID and network.'})
+                    except Exception as e:
+                        logging.error(f"Client initialization failed: {e}")
+                        signal_data['connection_status'] = 'disconnected'
+                        return jsonify({'success': False, 'error': f'Failed to initialize client: {str(e)}'})
+                        
         except Exception as e:
             logging.error(f"Failed to initialize client: {e}")
-            return jsonify({'success': False, 'error': f'Failed to initialize client: {e}'})
+            signal_data['connection_status'] = 'disconnected'
+            return jsonify({'success': False, 'error': f'Failed to initialize client: {str(e)}'})
         
         signal_thread = threading.Thread(target=run_signal_bot, daemon=True)
         signal_thread.start()
@@ -972,6 +1027,7 @@ def stop_bot():
     with update_lock:
         signal_data['is_running'] = False
         client_initialized = False
+        signal_data['connection_status'] = 'disconnected'
         
         if trading_client:
             try:
@@ -1014,22 +1070,13 @@ def manual_signal():
         # Get candle data
         open_price = signal_data.get('candle_open')
         
-        # If we don't have data yet, try to fetch it directly
+        # If we don't have data yet, use fallback
         if current_price is None or open_price is None:
-            try:
-                price_data = fetch_current_price()
-                if price_data:
-                    current_price = price_data.get('price')
-                    # Try to get open price from the same data or use current as fallback
-                    if open_price is None:
-                        open_price = current_price
-            except Exception as e:
-                logging.warning(f"Could not fetch price for manual signal: {e}")
-                # Use existing data or fallback
-                if current_price is None:
-                    current_price = 1.2000
-                if open_price is None:
-                    open_price = current_price
+            # Use a simulated price based on last known data or default
+            if current_price is None:
+                current_price = 1.2000
+            if open_price is None:
+                open_price = current_price
         
         # Generate manual signal immediately
         if current_price and open_price:
@@ -1073,6 +1120,7 @@ def get_signal():
             'manual_triggered': manual_triggered,
             'use_expiration': signal_data.get('use_expiration', False),
             'trade_expiration': signal_data.get('trade_expiration', 60),
+            'connection_status': signal_data.get('connection_status', 'disconnected'),
             'candle_data': {
                 'progress': signal_data.get('candle_progress', 0),
                 'open': signal_data.get('candle_open'),
@@ -1095,6 +1143,7 @@ def run_signal_bot():
     
     if trading_client is None:
         logging.error("Trading client not initialized")
+        signal_data['connection_status'] = 'disconnected'
         return
     
     last_signal_time = 0
@@ -1104,6 +1153,7 @@ def run_signal_bot():
     candle_low_price = None
     current_candle_data = []
     first_run = True
+    consecutive_errors = 0
     
     logging.info("Starting main signal loop")
     
@@ -1128,8 +1178,14 @@ def run_signal_bot():
                             signal_data['candle_low'] = candle_low_price
                             signal_data['price_data'] = current_price
                             signal_data['last_update'] = datetime.now().strftime('%H:%M:%S.%f')[:-3]
+                            signal_data['connection_status'] = 'connected'
+                        logging.info("Initial data fetched successfully")
+                    else:
+                        logging.warning("No price data received on first run")
+                        signal_data['connection_status'] = 'connecting'
                 except Exception as e:
                     logging.warning(f"Initial price fetch failed: {e}")
+                    signal_data['connection_status'] = 'connecting'
                 first_run = False
             
             should_update = False
@@ -1185,6 +1241,7 @@ def run_signal_bot():
                             signal_data['candle_low'] = candle_low_price
                             signal_data['candle_progress'] = progress
                             signal_data['candle_time_remaining'] = f"{max(0, timeframe - elapsed):.1f}s"
+                            signal_data['connection_status'] = 'connected'
                         
                         signal = generate_signal_from_candle(
                             current_price,
@@ -1199,9 +1256,16 @@ def run_signal_bot():
                             signal_data['current_signal'] = signal.get('signal')
                             signal_data['price_data'] = current_price
                             signal_data['last_update'] = datetime.now().strftime('%H:%M:%S.%f')[:-3]
+                        
+                        consecutive_errors = 0
                             
                 except Exception as e:
+                    consecutive_errors += 1
                     logging.error(f"Error fetching price in signal loop: {e}")
+                    if consecutive_errors > 5:
+                        signal_data['connection_status'] = 'disconnected'
+                    else:
+                        signal_data['connection_status'] = 'connecting'
                     
                 last_signal_time = current_time
             
@@ -1209,6 +1273,7 @@ def run_signal_bot():
             
         except Exception as e:
             logging.error(f"Signal bot error: {e}")
+            signal_data['connection_status'] = 'disconnected'
             time.sleep(0.5)
     
     logging.info("Signal bot thread stopped")
