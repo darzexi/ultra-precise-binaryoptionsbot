@@ -1,8 +1,0 @@
-{
-  "language": "python3",
-  "entrypoint": "main.py",
-  "run": "python3 main.py",
-  "packages": [
-    "python-3.10"
-  ]
-}
