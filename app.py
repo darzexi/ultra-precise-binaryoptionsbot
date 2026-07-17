@@ -3,6 +3,8 @@ import threading
 import os
 import logging
 import asyncio
+import re
+import json
 from datetime import datetime
 from flask import Flask, render_template_string, request, jsonify
 
@@ -38,7 +40,7 @@ def after_request(response):
 signal_data = {
     'asset': 'EURUSD_otc',
     'timeframe': 60,
-    'update_rate': 0.5,
+    'update_rate': 1,
     'manual_mode': False,
     'hotkey': 'space',
     'current_signal': None,
@@ -55,16 +57,57 @@ signal_data = {
     'candle_start_time': None,
     'manual_triggered': False,
     'connection_status': 'disconnected',
-    'consecutive_failures': 0,
-    'last_price_fetch': 0
+    'consecutive_failures': 0
 }
 
 signal_thread = None
 update_lock = threading.Lock()
-event_loop = None
 
 logging.basicConfig(level=logging.ERROR if not DEBUG_MODE else logging.INFO)
 logger = logging.getLogger(__name__)
+
+# ==================== SSID EXTRACTION ====================
+def extract_ssid(raw_ssid):
+    """Extract SSID from various formats"""
+    if not raw_ssid:
+        return None
+    
+    raw_ssid = raw_ssid.strip()
+    
+    # If it's the WebSocket message format: 42["auth",{"session":"xxx",...}]
+    if raw_ssid.startswith('42["auth"'):
+        try:
+            # Extract the JSON array
+            json_match = re.search(r'42(\[.*\])', raw_ssid)
+            if json_match:
+                data = json.loads(json_match.group(1))
+                if data and len(data) > 1 and isinstance(data[1], dict):
+                    if 'session' in data[1]:
+                        return data[1]['session']
+        except Exception as e:
+            logger.debug(f"Failed to parse WebSocket message: {e}")
+        
+        # Fallback: regex extraction
+        match = re.search(r'"session":"([^"]+)"', raw_ssid)
+        if match:
+            return match.group(1)
+    
+    # If it's a cookie string
+    if 'ssid=' in raw_ssid:
+        match = re.search(r'ssid=([^;]+)', raw_ssid)
+        if match:
+            return match.group(1)
+    
+    # If it's already the session value (alphanumeric, 20+ chars)
+    if re.match(r'^[a-zA-Z0-9_\-]{20,}$', raw_ssid):
+        return raw_ssid
+    
+    # Try to clean up - remove quotes and braces
+    cleaned = re.sub(r'[{}"\']', '', raw_ssid)
+    if re.match(r'^[a-zA-Z0-9_\-]{20,}$', cleaned):
+        return cleaned
+    
+    return raw_ssid
 
 # ==================== HELPER FUNCTIONS ====================
 def run_async(coro):
@@ -293,6 +336,15 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             border-radius: 4px;
             font-size: 12px;
         }
+        .extracted-ssid {
+            color: #28a745;
+            font-weight: bold;
+            margin-top: 5px;
+            padding: 5px;
+            background: #d4edda;
+            border-radius: 5px;
+            display: none;
+        }
         @media (max-width: 600px) {
             .settings-grid { grid-template-columns: 1fr; }
             .button-group { flex-direction: column; }
@@ -303,7 +355,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
 <body>
     <div class="container">
         <h1>🚀 PocketOption Signal Bot</h1>
-        <p class="subtitle">Compile Candles Mode - Works on Replit</p>
+        <p class="subtitle">Auto-Extract SSID - Works on Replit</p>
 
         <div id="signalDisplay" class="signal-display">
             <div style="font-size: 14px; color: #888;">Current Signal</div>
@@ -334,18 +386,21 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
 
         <div class="ssid-input">
             <label style="font-weight: 600; display: block; margin-bottom: 5px;">PocketOption SSID:</label>
-            <input type="text" id="ssidInput" placeholder="Enter your SSID from cookies" value="">
+            <input type="text" id="ssidInput" placeholder="Paste SSID or WebSocket auth message" value="">
             <small style="color: #856404; display: block; margin-top: 5px;">
-                💡 Enter just the session value (e.g., r7seffi1r662i33roiengjikcm)
+                💡 Paste the SSID value OR the full WebSocket message - it will auto-extract!
             </small>
+            <div class="extracted-ssid" id="extractedSsidDisplay">
+                ✅ Extracted: <span id="extractedSsidText"></span>
+            </div>
         </div>
 
         <div class="help-text">
-            <strong>🔍 How to get your SSID:</strong><br>
+            <strong>🔍 Get your SSID:</strong><br>
             1. Log in to <a href="https://pocketoption.com" target="_blank">pocketoption.com</a><br>
             2. Press <code>F12</code> → <code>Application</code> tab → <code>Cookies</code><br>
             3. Find <code>ssid</code> and copy the value<br>
-            4. Paste just the session value (long string)
+            4. Paste it above (the bot auto-extracts the session)
         </div>
 
         <div class="settings-grid">
@@ -426,8 +481,8 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         </div>
 
         <div class="log-area" id="logArea">
-            <div class="log-entry">[System] Bot initialized.</div>
-            <div class="log-entry connection">💡 Enter your SSID and click Test</div>
+            <div class="log-entry">[System] Bot initialized. Auto-extract SSID mode.</div>
+            <div class="log-entry connection">💡 Enter your SSID or WebSocket message and click Test</div>
         </div>
     </div>
 
@@ -446,6 +501,8 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         const dataSourceDisplay = document.getElementById('dataSourceDisplay');
         const ssidStatus = document.getElementById('ssidStatus');
         const logArea = document.getElementById('logArea');
+        const extractedSsidDisplay = document.getElementById('extractedSsidDisplay');
+        const extractedSsidText = document.getElementById('extractedSsidText');
 
         const candleProgressFill = document.getElementById('candleProgressFill');
         const candleProgressText = document.getElementById('candleProgressText');
@@ -470,14 +527,33 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         const useExpiration = document.getElementById('useExpiration');
         const tradeExpiration = document.getElementById('tradeExpiration');
 
-        hotkeyInput.addEventListener('input', function() {
-            const key = this.value.trim() || 'space';
-            document.getElementById('hotkeyDisplay').innerHTML = `<span class="hotkey-indicator">${key}</span>`;
+        // Auto-extract SSID on input
+        ssidInput.addEventListener('input', function() {
+            const raw = this.value.trim();
+            if (raw.length > 10) {
+                fetch('/extract_ssid', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ raw: raw })
+                })
+                .then(r => r.json())
+                .then(data => {
+                    if (data.success && data.extracted) {
+                        extractedSsidDisplay.style.display = 'block';
+                        extractedSsidText.textContent = data.extracted;
+                        extractedSsidText.style.color = '#28a745';
+                    } else {
+                        extractedSsidDisplay.style.display = 'none';
+                    }
+                });
+            } else {
+                extractedSsidDisplay.style.display = 'none';
+            }
         });
 
         testBtn.addEventListener('click', function() {
-            const ssid = ssidInput.value.trim();
-            if (!ssid) {
+            const raw = ssidInput.value.trim();
+            if (!raw) {
                 addLog('Please enter SSID first', 'error');
                 return;
             }
@@ -487,7 +563,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             fetch('/test_connection', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ ssid: ssid })
+                body: JSON.stringify({ raw: raw })
             })
             .then(r => r.json())
             .then(data => {
@@ -497,6 +573,9 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                     ssidStatus.textContent = 'Valid ✓';
                     ssidStatus.style.color = '#28a745';
                     addLog('✅ Connection successful! Price: ' + data.price, 'precise');
+                    if (data.extracted) {
+                        addLog('📡 Extracted SSID: ' + data.extracted.substring(0, 8) + '...', 'connection');
+                    }
                 } else {
                     connectionStatus.textContent = 'Failed ✗';
                     connectionStatus.className = 'status-disconnected';
@@ -540,8 +619,8 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         });
 
         startBtn.onclick = function() {
-            const ssid = ssidInput.value.trim();
-            if (!ssid) {
+            const raw = ssidInput.value.trim();
+            if (!raw) {
                 addLog('ERROR: SSID required', 'error');
                 return;
             }
@@ -552,7 +631,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
-                    ssid: ssid,
+                    raw: raw,
                     asset: assetSelect.value,
                     timeframe: parseInt(timeframeSelect.value),
                     update_rate: parseFloat(updateRate.value) || 1,
@@ -666,45 +745,58 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
 def index():
     return render_template_string(HTML_TEMPLATE)
 
-@app.route('/test_connection', methods=['POST'])
-def test_connection():
-    """Test connection using compile_candles - no persistent connection"""
+@app.route('/extract_ssid', methods=['POST'])
+def extract_ssid_route():
+    """Extract SSID from raw input"""
     try:
         data = request.json
-        ssid = data.get('ssid', '').strip()
+        raw = data.get('raw', '').strip()
+        extracted = extract_ssid(raw)
+        if extracted and len(extracted) > 10:
+            return jsonify({'success': True, 'extracted': extracted})
+        return jsonify({'success': False})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)})
+
+@app.route('/test_connection', methods=['POST'])
+def test_connection():
+    """Test connection with auto-extracted SSID"""
+    try:
+        data = request.json
+        raw = data.get('raw', '').strip()
         
-        if not ssid:
+        if not raw:
             return jsonify({'success': False, 'error': 'SSID required'})
+        
+        # Extract SSID
+        ssid = extract_ssid(raw)
+        
+        if not ssid or len(ssid) < 10:
+            return jsonify({'success': False, 'error': f'Could not extract valid SSID from input'})
         
         if not POCKET_OPTION_AVAILABLE:
             return jsonify({'success': False, 'error': 'BinaryOptionsToolsV2 not installed'})
         
-        # Quick test using compile_candles
+        # Test connection
         async def test():
             try:
                 client = PocketOptionAsync(ssid=ssid)
-                # Try to get candles with short timeout
+                # Try to get candles
                 candles = await asyncio.wait_for(
                     client.compile_candles('EURUSD_otc', 60, 5),
-                    timeout=10
+                    timeout=15
                 )
+                await client.disconnect()
                 if candles and len(candles) > 0:
-                    # Try to get balance too
-                    try:
-                        balance = await client.balance()
-                    except:
-                        balance = None
-                    
-                    await client.disconnect()
                     return {
                         'success': True, 
                         'price': candles[-1].get('close'),
-                        'balance': balance,
+                        'extracted': ssid,
                         'candle_count': len(candles)
                     }
-                return {'success': False, 'error': 'No candle data'}
+                return {'success': False, 'error': 'No candle data returned'}
             except asyncio.TimeoutError:
-                return {'success': False, 'error': 'Connection timeout - SSID may be invalid'}
+                return {'success': False, 'error': 'Connection timeout - SSID may be invalid or expired'}
             except Exception as e:
                 return {'success': False, 'error': str(e)}
         
@@ -723,15 +815,21 @@ def start_bot():
             return jsonify({'success': False, 'error': 'Already running'})
         
         config = request.json
-        ssid = config.get('ssid', '').strip()
+        raw = config.get('raw', '').strip()
         
-        if not ssid:
+        if not raw:
             return jsonify({'success': False, 'error': 'SSID required'})
+        
+        # Extract SSID
+        ssid = extract_ssid(raw)
+        
+        if not ssid or len(ssid) < 10:
+            return jsonify({'success': False, 'error': 'Could not extract valid SSID'})
         
         if not POCKET_OPTION_AVAILABLE:
             return jsonify({'success': False, 'error': 'BinaryOptionsToolsV2 not installed'})
         
-        # Validate SSID by testing connection
+        # Validate SSID
         async def validate():
             try:
                 client = PocketOptionAsync(ssid=ssid)
@@ -760,14 +858,13 @@ def start_bot():
             'current_signal': None,
             'price_data': None,
             'consecutive_failures': 0,
-            'connection_status': 'connected',
-            'last_price_fetch': 0
+            'connection_status': 'connected'
         })
         
         signal_thread = threading.Thread(target=run_signal_bot, daemon=True)
         signal_thread.start()
         
-        return jsonify({'success': True})
+        return jsonify({'success': True, 'extracted_ssid': ssid})
 
 @app.route('/stop', methods=['POST'])
 def stop_bot():
@@ -843,7 +940,7 @@ def fetch_current_price():
                 # Get latest candle
                 candles = await asyncio.wait_for(
                     client.compile_candles(asset, 5, 1),
-                    timeout=5
+                    timeout=8
                 )
                 await client.disconnect()
                 if candles and len(candles) > 0:
@@ -852,6 +949,9 @@ def fetch_current_price():
                         'price': float(latest.get('close', 0)),
                         'timestamp': time.time()
                     }
+                return None
+            except asyncio.TimeoutError:
+                logger.debug("Price fetch timeout")
                 return None
             except Exception as e:
                 logger.debug(f"Price fetch error: {e}")
@@ -1020,12 +1120,12 @@ if __name__ == '__main__':
     print("="*50)
     print(f"Server: http://{HOST}:{PORT}")
     print(f"Library: {'Available' if POCKET_OPTION_AVAILABLE else 'Not Available'}")
-    print("Mode: Compile Candles (Connects per request)")
+    print("Mode: Auto-Extract SSID + Compile Candles")
     print("="*50 + "\n")
-    print("💡 To get your SSID:")
-    print("1. Log in to pocketoption.com")
-    print("2. Press F12 -> Application -> Cookies")
-    print("3. Copy the 'ssid' value")
+    print("💡 You can paste:")
+    print("  - Just the SSID value: r7seffi1r662i33roiengjikcm")
+    print("  - Or the full WebSocket message: 42[\"auth\",{\"session\":\"...\"}]")
+    print("  - The bot will auto-extract the session!")
     print("="*50 + "\n")
     
     app.run(host=HOST, port=PORT, debug=DEBUG_MODE, threaded=True)
