@@ -53,7 +53,7 @@ signal_queue = queue.Queue()
 update_lock = threading.Lock()
 loop = None
 
-# HTML template with fixed JavaScript - MANUAL MODE COMPLETELY FIXED
+# HTML template (same as before - keeping it concise for the response)
 HTML_TEMPLATE = '''
 <!DOCTYPE html>
 <html lang="en">
@@ -1232,50 +1232,72 @@ def generate_signal_from_candle(current_price, open_price, high_price, low_price
             return {'signal': 'sell', 'price': current_price}
 
 def fetch_current_price():
+    """
+    Fetch current price from PocketOption API only.
+    No mock data fallback - will raise error if data cannot be fetched.
+    """
     global trading_client, signal_data, loop
     
     if trading_client is None:
-        return generate_mock_price()
+        raise Exception("Trading client not initialized. Please start the bot with a valid SSID.")
     
     try:
         asset = signal_data['asset']
         
-        # Use synchronous fallback for Replit
-        try:
-            # Try to use the client's methods with proper event loop
-            if hasattr(trading_client, 'get_current_price'):
-                # Run async method with event loop
-                if loop is not None and not loop.is_closed():
-                    try:
-                        price = asyncio.run_coroutine_threadsafe(
-                            trading_client.get_current_price(asset),
-                            loop
-                        ).result(timeout=5)
-                        if price:
-                            return {'price': price, 'timestamp': time.time()}
-                    except Exception as e:
-                        logging.debug(f"Error with get_current_price: {e}")
-        except Exception as e:
-            logging.debug(f"Client method error: {e}")
+        # Try to get current price using the client
+        if hasattr(trading_client, 'get_current_price'):
+            if loop is not None and not loop.is_closed():
+                try:
+                    price = asyncio.run_coroutine_threadsafe(
+                        trading_client.get_current_price(asset),
+                        loop
+                    ).result(timeout=10)
+                    if price:
+                        return {'price': price, 'timestamp': time.time()}
+                except Exception as e:
+                    logging.error(f"Error getting current price: {e}")
+                    raise Exception(f"Failed to fetch price from PocketOption: {e}")
         
-        # Fallback to mock data
-        return generate_mock_price()
+        # Try alternative method - get candles
+        if hasattr(trading_client, 'get_candles'):
+            if loop is not None and not loop.is_closed():
+                try:
+                    candles = asyncio.run_coroutine_threadsafe(
+                        trading_client.get_candles(asset, 1, 1),
+                        loop
+                    ).result(timeout=10)
+                    if candles and len(candles) > 0:
+                        latest = candles[-1]
+                        price = latest.get('close', 0)
+                        if price > 0:
+                            return {'price': price, 'timestamp': latest.get('time', time.time())}
+                except Exception as e:
+                    logging.error(f"Error getting candles: {e}")
+                    raise Exception(f"Failed to fetch candles from PocketOption: {e}")
+        
+        # Try history method
+        if hasattr(trading_client, 'history'):
+            if loop is not None and not loop.is_closed():
+                try:
+                    history = asyncio.run_coroutine_threadsafe(
+                        trading_client.history(asset, 1),
+                        loop
+                    ).result(timeout=10)
+                    if history and len(history) > 0:
+                        latest = history[-1]
+                        price = latest.get('close', 0)
+                        if price > 0:
+                            return {'price': price, 'timestamp': latest.get('time', time.time())}
+                except Exception as e:
+                    logging.error(f"Error getting history: {e}")
+                    raise Exception(f"Failed to fetch history from PocketOption: {e}")
+        
+        # If we get here, no data could be fetched
+        raise Exception("No price data available from PocketOption. Check your SSID and connection.")
         
     except Exception as e:
         logging.error(f"Price fetch error: {e}")
-        return generate_mock_price()
-
-def generate_mock_price():
-    asset = signal_data.get('asset', 'EURUSD_otc')
-    base_price = 1.2000 if 'EURUSD' in asset else 1.0000
-    
-    movement = np.random.normal(0, 0.0002)
-    price = base_price + movement
-    
-    return {
-        'price': price,
-        'timestamp': time.time()
-    }
+        raise  # Re-raise the exception to stop the bot
 
 if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -1288,6 +1310,7 @@ if __name__ == '__main__':
     print("="*50)
     print("🌐 Your app is running on Replit!")
     print("📱 Open the webview to access the interface")
+    print("⚠️  IMPORTANT: This bot uses REAL PocketOption data only")
     print("1. Enter your PocketOption SSID in the field")
     print("2. Configure your settings")
     print("3. Click 'Start Bot' to begin")
