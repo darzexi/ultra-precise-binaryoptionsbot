@@ -5,8 +5,16 @@ import threading
 import queue
 import numpy as np
 from flask import Flask, request, jsonify
-from BinaryOptionsToolsV2.pocketoption import PocketOptionAsync
 import logging
+
+# Try to import BinaryOptionsToolsV2, but handle if not available
+try:
+    from BinaryOptionsToolsV2.pocketoption import PocketOptionAsync
+    HAS_BINARY_OPTIONS = True
+except ImportError:
+    HAS_BINARY_OPTIONS = False
+    PocketOptionAsync = None
+    logging.warning("BinaryOptionsToolsV2 not available")
 
 app = Flask(__name__)
 
@@ -56,6 +64,10 @@ def run_async(coro):
 
 def get_client(ssid):
     """Get or create PocketOption client"""
+    if not HAS_BINARY_OPTIONS:
+        logger.error("BinaryOptionsToolsV2 not available")
+        return None
+    
     if state.get('client') is None and ssid:
         try:
             client = PocketOptionAsync(ssid=ssid)
@@ -69,7 +81,8 @@ def get_client(ssid):
 def fetch_price(client, asset):
     """Fetch current price using the client"""
     try:
-        # Get candles
+        if not client:
+            return None
         candles = run_async(client.get_candles(asset, 1, 1))
         if candles and len(candles) > 0:
             latest = candles[-1]
@@ -87,6 +100,8 @@ def fetch_price(client, asset):
 def get_candles(client, asset, timeframe, count=30):
     """Fetch candles from the API"""
     try:
+        if not client:
+            return None
         candles = run_async(client.get_candles(asset, timeframe, count))
         if candles and len(candles) > 0:
             return candles
@@ -97,7 +112,6 @@ def get_candles(client, asset, timeframe, count=30):
 def generate_signal_from_candle(current_price, open_price, high_price, low_price, progress, candle_history, is_manual=False):
     """Generate signal based on candle analysis"""
     try:
-        # If manual, generate decisive signal
         if is_manual:
             if current_price > open_price:
                 return 'buy'
@@ -106,7 +120,6 @@ def generate_signal_from_candle(current_price, open_price, high_price, low_price
             else:
                 return 'buy' if int(time.time()) % 2 == 0 else 'sell'
 
-        # Check expiration
         use_expiration = state.get('use_expiration', False)
         trade_expiration = state.get('trade_expiration', 60)
         timeframe = state.get('timeframe', 60)
@@ -117,7 +130,6 @@ def generate_signal_from_candle(current_price, open_price, high_price, low_price
             if remaining < trade_expiration:
                 return 'hold'
 
-        # Early in candle, use previous candle direction
         if progress < 10 and len(candle_history) >= 2:
             prev_close = candle_history[-2].get('close', current_price)
             if current_price > prev_close:
@@ -125,27 +137,22 @@ def generate_signal_from_candle(current_price, open_price, high_price, low_price
             elif current_price < prev_close:
                 return 'sell'
 
-        # Breakout patterns
         if high_price > open_price * 1.002 and current_price > open_price:
             return 'buy'
         elif low_price < open_price * 0.998 and current_price < open_price:
             return 'sell'
 
-        # Reversal patterns
         if len(candle_history) >= 3:
             last_candle = candle_history[-1]
             prev_candle = candle_history[-2]
             if last_candle and prev_candle:
-                # Bullish reversal
                 if (prev_candle.get('close', 0) < prev_candle.get('open', 0) and 
                     current_price > prev_candle.get('high', 0)):
                     return 'buy'
-                # Bearish reversal
                 if (prev_candle.get('close', 0) > prev_candle.get('open', 0) and 
                     current_price < prev_candle.get('low', 0)):
                     return 'sell'
 
-        # Trend following
         if current_price > open_price:
             return 'buy'
         elif current_price < open_price:
@@ -185,7 +192,6 @@ def run_signal_bot():
         try:
             current_time = time.time()
             
-            # Check for manual trigger
             manual_trigger_from_queue = False
             try:
                 while not state['signal_queue'].empty():
@@ -200,7 +206,6 @@ def run_signal_bot():
                 manual_triggered = True
                 logger.info("Manual trigger flag set to True")
             
-            # Determine if we should update
             should_update = False
             is_manual_update = False
             
@@ -215,14 +220,12 @@ def run_signal_bot():
                     is_manual_update = False
             
             if should_update:
-                # Fetch price data
                 price_data = fetch_price(client, state['asset'])
                 
                 if price_data:
                     current_price = price_data.get('price', 0)
                     timestamp = price_data.get('time', current_time)
                     
-                    # Initialize candle
                     if candle_open_price is None:
                         candle_open_price = price_data.get('open', current_price)
                         candle_high_price = price_data.get('high', current_price)
@@ -230,18 +233,15 @@ def run_signal_bot():
                         candle_start_time = timestamp
                         logger.info(f"Candle initialized at {candle_open_price}")
                     
-                    # Update candle high/low
                     if current_price > candle_high_price:
                         candle_high_price = current_price
                     if current_price < candle_low_price:
                         candle_low_price = current_price
                     
-                    # Calculate progress
                     timeframe = state.get('timeframe', 60)
                     elapsed = current_time - candle_start_time
                     progress = min((elapsed / timeframe) * 100, 100)
                     
-                    # Check if candle is complete
                     if elapsed >= timeframe:
                         candle_open_price = current_price
                         candle_high_price = current_price
@@ -262,7 +262,6 @@ def run_signal_bot():
                         
                         logger.info(f"Candle completed at {current_price}")
                     
-                    # Update state with candle data
                     with state_lock:
                         state['candle_open'] = candle_open_price
                         state['candle_high'] = candle_high_price
@@ -271,7 +270,6 @@ def run_signal_bot():
                         state['candle_time_remaining'] = f"{max(0, timeframe - elapsed):.1f}s"
                         state['candle_history'] = current_candle_data
                     
-                    # Generate signal
                     signal = generate_signal_from_candle(
                         current_price,
                         candle_open_price,
@@ -312,17 +310,21 @@ def start():
             return jsonify({'success': False, 'error': 'Bot already running'})
         
         config = request.json
+        if not config:
+            return jsonify({'success': False, 'error': 'Invalid JSON body'})
+        
         ssid = config.get('ssid', '').strip()
         
         if not ssid:
             return jsonify({'success': False, 'error': 'SSID is required'})
         
-        # Validate client
+        if not HAS_BINARY_OPTIONS:
+            return jsonify({'success': False, 'error': 'BinaryOptionsToolsV2 not available'})
+        
         client = get_client(ssid)
         if not client:
             return jsonify({'success': False, 'error': 'Failed to connect to PocketOption'})
         
-        # Update state
         state.update({
             'ssid': ssid,
             'asset': config.get('asset', 'EURUSD_otc'),
@@ -342,14 +344,12 @@ def start():
             'candle_history': []
         })
         
-        # Clear queue
         while not state['signal_queue'].empty():
             try:
                 state['signal_queue'].get_nowait()
             except:
                 break
         
-        # Start background thread
         signal_thread = threading.Thread(target=run_signal_bot, daemon=True)
         signal_thread.start()
         state['signal_thread'] = signal_thread
@@ -377,7 +377,6 @@ def manual():
     if not state.get('manual_mode', False):
         return jsonify({'success': False, 'error': 'Manual mode not enabled'})
     
-    # Queue manual signal
     state['signal_queue'].put({'manual': True, 'timestamp': time.time()})
     logger.info(f"Manual signal queued")
     
@@ -408,7 +407,6 @@ def get_signal():
             }
         }
         
-        # Reset manual triggered
         if manual_triggered:
             state['manual_triggered'] = False
             
@@ -416,48 +414,92 @@ def get_signal():
 
 @app.route('/')
 def index():
-    return jsonify({'error': 'Use the main page URL'})
+    return jsonify({'status': 'running', 'message': 'Binary Options Signal Bot API'})
 
 # Netlify Functions Handler
 def handler(event, context):
     """Main handler for Netlify Functions"""
-    method = event.get('httpMethod', 'GET')
-    path = event.get('path', '/')
-    headers = event.get('headers', {})
-    body = event.get('body', '')
-    
-    # Handle OPTIONS for CORS
-    if method == 'OPTIONS':
-        return {
-            'statusCode': 200,
-            'headers': {
-                'Access-Control-Allow-Origin': '*',
-                'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
-                'Access-Control-Allow-Headers': 'Content-Type'
-            },
-            'body': ''
-        }
-    
-    with app.test_request_context(
-        path=path,
-        method=method,
-        headers=headers,
-        data=body if body else None
-    ):
-        try:
-            response = app.full_dispatch_request()
+    try:
+        method = event.get('httpMethod', 'GET')
+        path = event.get('path', '/')
+        headers = event.get('headers', {})
+        
+        # Handle body properly
+        body = event.get('body', '')
+        if body and event.get('isBase64Encoded', False):
+            import base64
+            body = base64.b64decode(body).decode('utf-8')
+        
+        # Handle OPTIONS for CORS
+        if method == 'OPTIONS':
             return {
-                'statusCode': response.status_code,
+                'statusCode': 200,
                 'headers': {
                     'Access-Control-Allow-Origin': '*',
-                    'Content-Type': 'application/json' if response.is_json else 'text/html'
+                    'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
+                    'Access-Control-Allow-Headers': 'Content-Type'
                 },
-                'body': response.get_data(as_text=True)
+                'body': ''
             }
-        except Exception as e:
-            logger.error(f"Handler error: {e}")
-            return {
-                'statusCode': 500,
-                'headers': {'Access-Control-Allow-Origin': '*'},
-                'body': json.dumps({'error': str(e)})
-            }
+        
+        # Create a test client and dispatch request
+        with app.test_request_context(
+            path=path,
+            method=method,
+            headers=headers,
+            data=body if body else None,
+            content_type=headers.get('Content-Type', 'application/json')
+        ):
+            # Pre-process the request to handle JSON body
+            if body and headers.get('Content-Type', '').startswith('application/json'):
+                try:
+                    request_json = json.loads(body) if body else {}
+                    request._cached_json = request_json
+                except json.JSONDecodeError as e:
+                    logger.error(f"JSON decode error: {e}")
+                    return {
+                        'statusCode': 400,
+                        'headers': {
+                            'Access-Control-Allow-Origin': '*',
+                            'Content-Type': 'application/json'
+                        },
+                        'body': json.dumps({'success': False, 'error': 'Invalid JSON'})
+                    }
+            
+            try:
+                response = app.full_dispatch_request()
+                
+                # Ensure we always return a valid JSON response
+                response_data = response.get_data(as_text=True)
+                if not response_data:
+                    response_data = json.dumps({'success': False, 'error': 'Empty response'})
+                
+                return {
+                    'statusCode': response.status_code,
+                    'headers': {
+                        'Access-Control-Allow-Origin': '*',
+                        'Content-Type': 'application/json'
+                    },
+                    'body': response_data
+                }
+            except Exception as e:
+                logger.error(f"Error processing request: {e}")
+                return {
+                    'statusCode': 500,
+                    'headers': {
+                        'Access-Control-Allow-Origin': '*',
+                        'Content-Type': 'application/json'
+                    },
+                    'body': json.dumps({'success': False, 'error': str(e)})
+                }
+                
+    except Exception as e:
+        logger.error(f"Handler error: {e}")
+        return {
+            'statusCode': 500,
+            'headers': {
+                'Access-Control-Allow-Origin': '*',
+                'Content-Type': 'application/json'
+            },
+            'body': json.dumps({'success': False, 'error': 'Internal server error'})
+        }
