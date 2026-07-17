@@ -1256,19 +1256,3 @@ def generate_mock_price():
         'price': price,
         'timestamp': time.time()
     }
-
-if __name__ == '__main__':
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-    
-    print("\n" + "="*50)
-    print("🚀 PocketOption Signal Bot - 100% Real-time Current Candle")
-    print("="*50)
-    print("1. Open your browser and go to: http://localhost:5000")
-    print("2. Enter your PocketOption SSID in the field")
-    print("3. Configure your settings")
-    print("4. Click 'Start Bot' to begin")
-    print("5. Bot tracks ONLY the current candle in real-time")
-    print("6. Manual Mode: Enable and use hotkey or button for manual signals")
-    print("="*50 + "\n")
-    
-    app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
