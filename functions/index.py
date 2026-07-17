@@ -7,6 +7,7 @@ import numpy as np
 from flask import Flask, request, jsonify, render_template_string
 from BinaryOptionsToolsV2.pocketoption import PocketOptionAsync
 import logging
+import os
 
 # Initialize Flask app
 app = Flask(__name__)
@@ -359,7 +360,7 @@ def manual():
     state['signal_queue'].put({'manual': True, 'timestamp': time.time()})
     logger.info(f"Manual signal queued")
     
-    return jsonify({'success': True, 'signal': 'pending', 'price': state.get('price_data', '--')})
+    return jsonify({'success': True})
 
 @app.route('/signal')
 def get_signal():
@@ -391,13 +392,28 @@ def get_signal():
             
         return jsonify(response)
 
-# Netlify Functions Handler - FIXED
+# --- ADD THIS: Root route to serve HTML ---
+@app.route('/')
+def serve_index():
+    """Serve the main HTML page"""
+    try:
+        # Try to read from static folder first
+        with open(os.path.join(os.path.dirname(__file__), 'static', 'index.html'), 'r') as f:
+            html_content = f.read()
+        return html_content, 200, {'Content-Type': 'text/html'}
+    except:
+        # Fallback: return a simple message
+        return '<html><body><h1>PocketOption Signal Bot</h1><p>Please deploy with static/index.html</p></body></html>', 200, {'Content-Type': 'text/html'}
+
+# Netlify Functions Handler
 def handler(event, context):
     """Main handler for Netlify Functions"""
     method = event.get('httpMethod', 'GET')
     path = event.get('path', '/')
     headers = event.get('headers', {})
     body = event.get('body', '')
+    
+    logger.info(f"Handler called: method={method}, path={path}")
     
     # Handle OPTIONS for CORS
     if method == 'OPTIONS':
@@ -411,14 +427,54 @@ def handler(event, context):
             'body': ''
         }
     
-    # Strip the function path
-    # Netlify calls with path like "/.netlify/functions/index/start"
-    # We want to extract "/start" from it
-    function_path = '/.netlify/functions/index'
-    if path.startswith(function_path):
-        path = path[len(function_path):] or '/'
+    # Extract the actual path
+    # Remove the function prefix
+    function_prefix = '/.netlify/functions/index'
+    if path.startswith(function_prefix):
+        path = path[len(function_prefix):] or '/'
+    elif path.startswith('/api/'):
+        path = path[4:] or '/'
     
-    # Create request context
+    logger.info(f"Extracted path: {path}")
+    
+    # If path is root, serve the HTML
+    if path == '/' or path == '':
+        try:
+            # Try to read the static file
+            static_path = os.path.join(os.path.dirname(__file__), 'static', 'index.html')
+            if os.path.exists(static_path):
+                with open(static_path, 'r') as f:
+                    html_content = f.read()
+                return {
+                    'statusCode': 200,
+                    'headers': {
+                        'Access-Control-Allow-Origin': '*',
+                        'Content-Type': 'text/html'
+                    },
+                    'body': html_content
+                }
+            else:
+                # Return a minimal HTML page
+                return {
+                    'statusCode': 200,
+                    'headers': {
+                        'Access-Control-Allow-Origin': '*',
+                        'Content-Type': 'text/html'
+                    },
+                    'body': '<html><body><h1>PocketOption Signal Bot</h1><p>Deployed on Netlify</p></body></html>'
+                }
+        except Exception as e:
+            logger.error(f"Error serving HTML: {e}")
+            return {
+                'statusCode': 500,
+                'headers': {
+                    'Access-Control-Allow-Origin': '*',
+                    'Content-Type': 'application/json'
+                },
+                'body': json.dumps({'error': f'Error serving HTML: {str(e)}'})
+            }
+    
+    # Create request context for Flask
     with app.test_request_context(
         path=path,
         method=method,
@@ -426,7 +482,7 @@ def handler(event, context):
         data=body if body else None
     ):
         try:
-            # Dispatch the request
+            # Dispatch the request to Flask
             response = app.full_dispatch_request()
             
             # Get response data
@@ -436,7 +492,7 @@ def handler(event, context):
                 'statusCode': response.status_code,
                 'headers': {
                     'Access-Control-Allow-Origin': '*',
-                    'Content-Type': 'application/json'
+                    'Content-Type': response.content_type or 'application/json'
                 },
                 'body': response_data
             }
