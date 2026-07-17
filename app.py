@@ -11,7 +11,7 @@ from datetime import datetime
 from flask import Flask, render_template_string, request, jsonify
 import numpy as np
 
-# Import PocketOption with timeout handling
+# Try to import PocketOption for data processing
 try:
     from BinaryOptionsToolsV2.pocketoption import PocketOptionAsync
     POCKET_OPTION_AVAILABLE = True
@@ -45,7 +45,7 @@ signal_data = {
     'timeframe': 60,
     'update_rate': 0.5,
     'manual_mode': False,
-    'websocket_mode': True,
+    'websocket_mode': False,  # Disabled by default
     'hotkey': 'space',
     'current_signal': None,
     'last_update': None,
@@ -62,21 +62,19 @@ signal_data = {
     'manual_triggered': False,
     'connection_status': 'disconnected',
     'consecutive_failures': 0,
-    'candle_history': [],
-    'use_rest_fallback': False
+    'candle_history': []
 }
 
 trading_client = None
 signal_thread = None
 update_lock = threading.Lock()
-rest_session = None
 
 logging.basicConfig(level=logging.ERROR if not DEBUG_MODE else logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ==================== REST API HELPER ====================
+# ==================== POCKETOPTION REST API ====================
 class PocketOptionREST:
-    """REST API fallback for PocketOption"""
+    """Pure REST API client for PocketOption - No WebSocket"""
     
     def __init__(self, ssid):
         self.ssid = ssid
@@ -84,11 +82,19 @@ class PocketOptionREST:
         self.session.cookies.set('ssid', ssid)
         self.session.headers.update({
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            'Accept': 'application/json',
+            'Accept': 'application/json, text/plain, */*',
             'Accept-Language': 'en-US,en;q=0.9',
-            'Referer': 'https://pocketoption.com/en/'
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Referer': 'https://pocketoption.com/en/',
+            'Origin': 'https://pocketoption.com',
+            'Connection': 'keep-alive',
+            'Sec-Fetch-Dest': 'empty',
+            'Sec-Fetch-Mode': 'cors',
+            'Sec-Fetch-Site': 'same-origin'
         })
         self.base_url = 'https://pocketoption.com'
+        self.last_price = None
+        self.last_candles = []
     
     def get_current_price(self, asset):
         """Get current price via REST API"""
@@ -97,33 +103,55 @@ class PocketOptionREST:
             response = self.session.get(
                 f'{self.base_url}/api/trade/current-price',
                 params={'asset': asset},
-                timeout=5
+                timeout=10
             )
             if response.status_code == 200:
                 data = response.json()
                 if data.get('price'):
-                    return float(data['price'])
-        except:
-            pass
+                    price = float(data['price'])
+                    self.last_price = price
+                    return price
+        except Exception as e:
+            logger.debug(f"Main price endpoint failed: {e}")
         
         # Try alternative endpoint
         try:
             response = self.session.get(
-                f'{self.base_url}/api/assets/current-price/{asset}',
-                timeout=5
+                f'{self.base_url}/api/assets/current-price',
+                params={'asset': asset},
+                timeout=10
             )
             if response.status_code == 200:
                 data = response.json()
                 if data.get('price'):
-                    return float(data['price'])
-        except:
-            pass
+                    price = float(data['price'])
+                    self.last_price = price
+                    return price
+        except Exception as e:
+            logger.debug(f"Alt price endpoint failed: {e}")
+        
+        # Try quotes endpoint
+        try:
+            response = self.session.get(
+                f'{self.base_url}/api/trade/quotes',
+                params={'asset': asset},
+                timeout=10
+            )
+            if response.status_code == 200:
+                data = response.json()
+                if data.get('data') and data['data'].get('price'):
+                    price = float(data['data']['price'])
+                    self.last_price = price
+                    return price
+        except Exception as e:
+            logger.debug(f"Quotes endpoint failed: {e}")
         
         return None
     
-    def get_candles(self, asset, timeframe, count):
-        """Get candles via REST API"""
+    def get_candles(self, asset, timeframe, count=100):
+        """Get candle data via REST API"""
         try:
+            # Try candles endpoint
             response = self.session.get(
                 f'{self.base_url}/api/trade/candles',
                 params={
@@ -131,15 +159,68 @@ class PocketOptionREST:
                     'timeframe': timeframe,
                     'count': count
                 },
-                timeout=5
+                timeout=10
             )
             if response.status_code == 200:
                 data = response.json()
                 if data.get('candles'):
+                    self.last_candles = data['candles']
                     return data['candles']
+        except Exception as e:
+            logger.debug(f"Candles endpoint failed: {e}")
+        
+        # Try history endpoint
+        try:
+            response = self.session.get(
+                f'{self.base_url}/api/trade/history',
+                params={
+                    'asset': asset,
+                    'timeframe': timeframe,
+                    'limit': count
+                },
+                timeout=10
+            )
+            if response.status_code == 200:
+                data = response.json()
+                if data.get('data'):
+                    self.last_candles = data['data']
+                    return data['data']
+        except Exception as e:
+            logger.debug(f"History endpoint failed: {e}")
+        
+        # Try OTC candles
+        try:
+            response = self.session.get(
+                f'{self.base_url}/api/trade/otc-candles',
+                params={
+                    'asset': asset,
+                    'timeframe': timeframe,
+                    'count': count
+                },
+                timeout=10
+            )
+            if response.status_code == 200:
+                data = response.json()
+                if data.get('candles'):
+                    self.last_candles = data['candles']
+                    return data['candles']
+        except Exception as e:
+            logger.debug(f"OTC candles endpoint failed: {e}")
+        
+        return None
+    
+    def get_asset_info(self, asset):
+        """Get asset information"""
+        try:
+            response = self.session.get(
+                f'{self.base_url}/api/assets/info',
+                params={'asset': asset},
+                timeout=10
+            )
+            if response.status_code == 200:
+                return response.json()
         except:
             pass
-        
         return None
 
 # ==================== HTML TEMPLATE ====================
@@ -148,7 +229,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>PocketOption Signal Bot</title>
+    <title>PocketOption Signal Bot - REST API</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
@@ -309,7 +390,6 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         .log-entry.precise { color: #ffd700; }
         .log-entry.manual { color: #ff9800; font-weight: bold; }
         .log-entry.connection { color: #00bcd4; }
-        .log-entry.fallback { color: #ff9800; }
         .ssid-input {
             margin-top: 15px;
             padding: 10px;
@@ -345,25 +425,34 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         .candle-open { color: #ffc107; }
         .status-connected { color: #28a745; }
         .status-disconnected { color: #dc3545; }
-        .status-fallback { color: #ff9800; }
         @media (max-width: 600px) {
             .settings-grid { grid-template-columns: 1fr; }
             .button-group { flex-direction: column; }
             .btn { width: 100%; }
         }
+        .method-badge {
+            display: inline-block;
+            padding: 2px 10px;
+            border-radius: 10px;
+            font-size: 11px;
+            font-weight: bold;
+            margin-left: 5px;
+        }
+        .method-rest { background: #ff9800; color: white; }
+        .method-websocket { background: #4caf50; color: white; }
     </style>
 </head>
 <body>
     <div class="container">
         <h1>🚀 PocketOption Signal Bot</h1>
-        <p class="subtitle">Real-time Market Analysis</p>
+        <p class="subtitle">REST API Mode - No WebSocket Required</p>
 
         <div id="signalDisplay" class="signal-display">
             <div style="font-size: 14px; color: #888;">Current Signal</div>
             <div class="signal-text" id="signalText">WAITING</div>
             <div class="signal-price" id="signalPrice">Price: --</div>
             <div class="signal-time" id="signalTime">Last Update: --</div>
-            <div class="accuracy-badge" id="accuracyBadge">🎯 Live Mode</div>
+            <div class="accuracy-badge" id="accuracyBadge">🎯 REST API Mode</div>
             
             <div class="candle-progress">
                 <div style="display: flex; justify-content: space-between;">
@@ -429,10 +518,10 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                 </div>
             </div>
             <div class="setting-group">
-                <label>WebSocket Mode</label>
+                <label>Data Source</label>
                 <div class="checkbox-group">
-                    <input type="checkbox" id="websocketMode" checked>
-                    <label for="websocketMode">Use Real-time Data</label>
+                    <input type="checkbox" id="websocketMode" disabled>
+                    <label for="websocketMode" style="color: #999;">REST API Only</label>
                 </div>
             </div>
             <div class="setting-group">
@@ -464,12 +553,12 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             <div class="status-item"><span>Status:</span><span id="statusText">Stopped</span></div>
             <div class="status-item"><span>Connection:</span><span id="connectionStatus" class="status-disconnected">Disconnected</span></div>
             <div class="status-item"><span>Mode:</span><span id="modeDisplay">Automatic</span></div>
-            <div class="status-item"><span>Data Source:</span><span id="dataSourceDisplay">WebSocket</span></div>
+            <div class="status-item"><span>Data Source:</span><span id="dataSourceDisplay">REST API <span class="method-badge method-rest">REST</span></span></div>
             <div class="status-item"><span>SSID:</span><span id="ssidStatus">Not Set</span></div>
         </div>
 
         <div class="log-area" id="logArea">
-            <div class="log-entry">[System] Bot initialized.</div>
+            <div class="log-entry">[System] Bot initialized. REST API Mode.</div>
         </div>
     </div>
 
@@ -523,7 +612,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                 addLog('Please enter SSID first', 'error');
                 return;
             }
-            addLog('Testing connection...', 'connection');
+            addLog('Testing REST API connection...', 'connection');
             fetch('/test_connection', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -536,10 +625,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                     connectionStatus.className = 'status-connected';
                     ssidStatus.textContent = 'Valid';
                     ssidStatus.style.color = '#28a745';
-                    addLog('✅ Connection successful!', 'precise');
-                    if (data.method) {
-                        addLog('📡 Using: ' + data.method, 'connection');
-                    }
+                    addLog('✅ Connection successful! Price: ' + data.price, 'precise');
                 } else {
                     connectionStatus.textContent = 'Failed ✗';
                     connectionStatus.className = 'status-disconnected';
@@ -612,7 +698,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                     statusText.style.color = '#28a745';
                     ssidStatus.textContent = 'Set';
                     ssidStatus.style.color = '#28a745';
-                    addLog('✅ Bot started', 'precise');
+                    addLog('✅ Bot started (REST API)', 'precise');
                     startPolling();
                 } else {
                     addLog('❌ Failed: ' + data.error, 'error');
@@ -667,16 +753,10 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                             if (data.connection_status === 'connected') {
                                 connectionStatus.textContent = 'Connected ✓';
                                 connectionStatus.className = 'status-connected';
-                            } else if (data.connection_status === 'fallback') {
-                                connectionStatus.textContent = 'Fallback Mode';
-                                connectionStatus.className = 'status-fallback';
                             } else {
                                 connectionStatus.textContent = 'Disconnected ✗';
                                 connectionStatus.className = 'status-disconnected';
                             }
-                        }
-                        if (data.data_source) {
-                            dataSourceDisplay.textContent = data.data_source;
                         }
                     })
                     .catch(err => console.error('Polling error:', err));
@@ -709,7 +789,7 @@ def index():
 
 @app.route('/test_connection', methods=['POST'])
 def test_connection():
-    """Test PocketOption connection - tries WebSocket first, then REST"""
+    """Test PocketOption REST API connection"""
     try:
         data = request.json
         ssid = data.get('ssid', '').strip()
@@ -717,64 +797,26 @@ def test_connection():
         if not ssid:
             return jsonify({'success': False, 'error': 'SSID required'})
         
-        # Try WebSocket first
-        if POCKET_OPTION_AVAILABLE:
-            try:
-                import asyncio
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                
-                # Try with short timeout
-                po = PocketOptionAsync(ssid=ssid)
-                
-                # Try to get candles using compile_candles
-                try:
-                    candles = loop.run_until_complete(
-                        asyncio.wait_for(po.compile_candles('EURUSD_otc', 60, 3), timeout=5)
-                    )
-                    if candles and len(candles) > 0:
-                        loop.close()
-                        return jsonify({'success': True, 'method': 'WebSocket (compile_candles)'})
-                except asyncio.TimeoutError:
-                    logger.debug("WebSocket compile_candles timeout")
-                except Exception as e:
-                    logger.debug(f"WebSocket compile_candles failed: {e}")
-                
-                # Try history
-                try:
-                    candles = loop.run_until_complete(
-                        asyncio.wait_for(po.history('EURUSD_otc', 60), timeout=5)
-                    )
-                    if candles and len(candles) > 0:
-                        loop.close()
-                        return jsonify({'success': True, 'method': 'WebSocket (history)'})
-                except asyncio.TimeoutError:
-                    logger.debug("WebSocket history timeout")
-                except Exception as e:
-                    logger.debug(f"WebSocket history failed: {e}")
-                
-                loop.close()
-                
-            except Exception as e:
-                logger.debug(f"WebSocket test failed: {e}")
+        # Test REST API
+        rest = PocketOptionREST(ssid)
+        price = rest.get_current_price('EURUSD_otc')
         
-        # Try REST fallback
-        try:
-            rest = PocketOptionREST(ssid)
-            price = rest.get_current_price('EURUSD_otc')
-            if price:
-                return jsonify({'success': True, 'method': 'REST API', 'price': price})
-        except Exception as e:
-            logger.debug(f"REST test failed: {e}")
+        if price:
+            return jsonify({'success': True, 'price': price, 'method': 'REST API'})
+        else:
+            # Try to get candles as fallback
+            candles = rest.get_candles('EURUSD_otc', 60, 1)
+            if candles and len(candles) > 0:
+                return jsonify({'success': True, 'price': candles[-1].get('close'), 'method': 'REST API (candles)'})
         
-        return jsonify({'success': False, 'error': 'Could not connect. Check SSID.'})
+        return jsonify({'success': False, 'error': 'Could not fetch data. Check SSID.'})
         
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)})
 
 @app.route('/start', methods=['POST'])
 def start_bot():
-    global signal_thread, signal_data, trading_client, rest_session
+    global signal_thread, signal_data, trading_client
     
     with update_lock:
         if signal_data['is_running']:
@@ -799,24 +841,17 @@ def start_bot():
             'current_signal': None,
             'price_data': None,
             'consecutive_failures': 0,
-            'connection_status': 'connected',
-            'use_rest_fallback': False
+            'connection_status': 'connected'
         })
         
-        # Initialize WebSocket client if available
-        if POCKET_OPTION_AVAILABLE:
-            try:
-                trading_client = PocketOptionAsync(ssid=ssid)
-                signal_data['connection_status'] = 'connected'
-                logger.info("WebSocket client initialized")
-            except Exception as e:
-                logger.warning(f"WebSocket init failed: {e}, using REST fallback")
-                trading_client = None
-                signal_data['use_rest_fallback'] = True
-                signal_data['connection_status'] = 'fallback'
+        # Initialize REST client
+        trading_client = PocketOptionREST(ssid)
         
-        # Always initialize REST fallback
-        rest_session = PocketOptionREST(ssid)
+        # Test connection
+        test_price = trading_client.get_current_price(signal_data['asset'])
+        if not test_price:
+            signal_data['is_running'] = False
+            return jsonify({'success': False, 'error': 'Could not connect. Check SSID.'})
         
         signal_thread = threading.Thread(target=run_signal_bot, daemon=True)
         signal_thread.start()
@@ -825,12 +860,11 @@ def start_bot():
 
 @app.route('/stop', methods=['POST'])
 def stop_bot():
-    global signal_data, trading_client, rest_session
+    global signal_data, trading_client
     with update_lock:
         signal_data['is_running'] = False
         signal_data['connection_status'] = 'disconnected'
         trading_client = None
-        rest_session = None
     return jsonify({'success': True})
 
 @app.route('/manual_signal', methods=['POST'])
@@ -868,7 +902,6 @@ def get_signal():
             'timestamp': signal_data.get('last_update'),
             'manual_triggered': signal_data.get('manual_triggered', False),
             'connection_status': signal_data.get('connection_status', 'disconnected'),
-            'data_source': 'WebSocket' if not signal_data.get('use_rest_fallback') else 'REST Fallback',
             'candle_data': {
                 'progress': signal_data.get('candle_progress', 0),
                 'open': signal_data.get('candle_open'),
@@ -884,9 +917,9 @@ def get_signal():
 
 # ==================== CORE LOGIC ====================
 def run_signal_bot():
-    global signal_data, trading_client, rest_session
+    global signal_data, trading_client
     
-    logger.info("Signal bot started")
+    logger.info("Signal bot started (REST API mode)")
     
     candle_start_time = time.time()
     candle_open_price = None
@@ -895,6 +928,10 @@ def run_signal_bot():
     current_candle_data = []
     last_signal_time = 0
     consecutive_failures = 0
+    last_candle_refresh = 0
+    
+    # Get initial candles
+    refresh_candles()
     
     while signal_data['is_running']:
         try:
@@ -903,6 +940,11 @@ def run_signal_bot():
             if current_time - last_signal_time < signal_data['update_rate']:
                 time.sleep(0.05)
                 continue
+            
+            # Refresh candles periodically
+            if current_time - last_candle_refresh > 30:
+                refresh_candles()
+                last_candle_refresh = current_time
             
             # Fetch current price
             price_data = fetch_current_price()
@@ -917,7 +959,7 @@ def run_signal_bot():
                 continue
             
             consecutive_failures = 0
-            signal_data['connection_status'] = 'connected' if not signal_data.get('use_rest_fallback') else 'fallback'
+            signal_data['connection_status'] = 'connected'
             signal_data['consecutive_failures'] = 0
             
             current_price = price_data.get('price', 0)
@@ -993,6 +1035,30 @@ def run_signal_bot():
     
     logger.info("Signal bot stopped")
 
+def refresh_candles():
+    """Refresh candle history"""
+    global signal_data, trading_client
+    
+    if not trading_client:
+        return
+    
+    try:
+        asset = signal_data['asset']
+        timeframe = signal_data['timeframe']
+        
+        candles = trading_client.get_candles(asset, timeframe, 50)
+        if candles:
+            with update_lock:
+                signal_data['candle_history'] = candles
+                if len(candles) > 0:
+                    latest = candles[-1]
+                    signal_data['candle_open'] = latest.get('open')
+                    signal_data['candle_high'] = latest.get('max')
+                    signal_data['candle_low'] = latest.get('min')
+            logger.info(f"Refreshed {len(candles)} candles")
+    except Exception as e:
+        logger.debug(f"Candle refresh failed: {e}")
+
 def generate_signal(current_price, open_price, high_price, low_price, progress, candle_history):
     """Generate signal based on price action"""
     try:
@@ -1043,71 +1109,41 @@ def generate_signal(current_price, open_price, high_price, low_price, progress, 
         return 'hold'
 
 def fetch_current_price():
-    """Fetch price using WebSocket with REST fallback"""
-    global trading_client, signal_data, rest_session
+    """Fetch price using REST API only"""
+    global trading_client, signal_data
+    
+    if not trading_client:
+        return None
     
     asset = signal_data.get('asset', 'EURUSD_otc')
     
-    # Try WebSocket first if available
-    if trading_client and POCKET_OPTION_AVAILABLE and not signal_data.get('use_rest_fallback'):
-        try:
-            import asyncio
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            
-            # Try compile_candles for latest price
-            try:
-                candles = loop.run_until_complete(
-                    asyncio.wait_for(trading_client.compile_candles(asset, 5, 1), timeout=3)
-                )
-                if candles and len(candles) > 0:
-                    latest = candles[-1]
-                    close_price = float(latest.get('close', 0))
-                    if close_price > 0:
-                        loop.close()
-                        return {'price': close_price, 'timestamp': time.time()}
-            except asyncio.TimeoutError:
-                logger.debug("WebSocket compile_candles timeout, using REST fallback")
-                signal_data['use_rest_fallback'] = True
-                signal_data['connection_status'] = 'fallback'
-            except Exception as e:
-                logger.debug(f"WebSocket compile_candles failed: {e}")
-                signal_data['use_rest_fallback'] = True
-                signal_data['connection_status'] = 'fallback'
-            
-            loop.close()
-        except Exception as e:
-            logger.debug(f"WebSocket fetch failed: {e}")
-            signal_data['use_rest_fallback'] = True
-            signal_data['connection_status'] = 'fallback'
-    
-    # Use REST fallback
-    if rest_session:
-        try:
-            price = rest_session.get_current_price(asset)
-            if price:
-                return {'price': price, 'timestamp': time.time()}
-            
-            # Try candles via REST
-            candles = rest_session.get_candles(asset, 5, 1)
-            if candles and len(candles) > 0:
-                latest = candles[-1]
-                close_price = float(latest.get('close', 0))
-                if close_price > 0:
-                    return {'price': close_price, 'timestamp': time.time()}
-        except Exception as e:
-            logger.debug(f"REST fetch failed: {e}")
-    
-    return None
+    try:
+        # Get current price
+        price = trading_client.get_current_price(asset)
+        if price:
+            return {'price': price, 'timestamp': time.time()}
+        
+        # Fallback to candles
+        candles = trading_client.get_candles(asset, 5, 1)
+        if candles and len(candles) > 0:
+            latest = candles[-1]
+            close_price = float(latest.get('close', 0))
+            if close_price > 0:
+                return {'price': close_price, 'timestamp': time.time()}
+        
+        return None
+        
+    except Exception as e:
+        logger.error(f"Price fetch error: {e}")
+        return None
 
 # ==================== MAIN ====================
 if __name__ == '__main__':
     print("\n" + "="*50)
-    print("🚀 PocketOption Signal Bot")
+    print("🚀 PocketOption Signal Bot - REST API Mode")
     print("="*50)
     print(f"Server: http://{HOST}:{PORT}")
-    print(f"Library: {'Available' if POCKET_OPTION_AVAILABLE else 'Not Available'}")
-    print("Mode: WebSocket + REST Fallback")
+    print("Mode: REST API (No WebSocket)")
     print("="*50 + "\n")
     
     app.run(host=HOST, port=PORT, debug=DEBUG_MODE, threaded=True)
