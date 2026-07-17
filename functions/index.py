@@ -4,10 +4,11 @@ import asyncio
 import threading
 import queue
 import numpy as np
-from flask import Flask, request, jsonify, render_template_string
+from flask import Flask, request, jsonify
 from BinaryOptionsToolsV2.pocketoption import PocketOptionAsync
 import logging
 import os
+import sys
 
 # Initialize Flask app
 app = Flask(__name__)
@@ -392,18 +393,30 @@ def get_signal():
             
         return jsonify(response)
 
-# --- ADD THIS: Root route to serve HTML ---
 @app.route('/')
 def serve_index():
     """Serve the main HTML page"""
     try:
-        # Try to read from static folder first
-        with open(os.path.join(os.path.dirname(__file__), 'static', 'index.html'), 'r') as f:
-            html_content = f.read()
-        return html_content, 200, {'Content-Type': 'text/html'}
-    except:
-        # Fallback: return a simple message
-        return '<html><body><h1>PocketOption Signal Bot</h1><p>Please deploy with static/index.html</p></body></html>', 200, {'Content-Type': 'text/html'}
+        static_path = os.path.join(os.path.dirname(__file__), 'static', 'index.html')
+        if os.path.exists(static_path):
+            with open(static_path, 'r') as f:
+                html_content = f.read()
+            return html_content, 200, {'Content-Type': 'text/html'}
+    except Exception as e:
+        logger.error(f"Error reading static file: {e}")
+    
+    # Fallback HTML
+    return """
+    <!DOCTYPE html>
+    <html>
+    <head><title>PocketOption Signal Bot</title></head>
+    <body>
+        <h1>PocketOption Signal Bot</h1>
+        <p>Please ensure static/index.html exists</p>
+        <p>Current path: {}</p>
+    </body>
+    </html>
+    """.format(os.path.dirname(__file__)), 200, {'Content-Type': 'text/html'}
 
 # Netlify Functions Handler
 def handler(event, context):
@@ -412,8 +425,6 @@ def handler(event, context):
     path = event.get('path', '/')
     headers = event.get('headers', {})
     body = event.get('body', '')
-    
-    logger.info(f"Handler called: method={method}, path={path}")
     
     # Handle OPTIONS for CORS
     if method == 'OPTIONS':
@@ -427,56 +438,27 @@ def handler(event, context):
             'body': ''
         }
     
-    # Extract the actual path
-    # Remove the function prefix
-    function_prefix = '/.netlify/functions/index'
-    if path.startswith(function_prefix):
-        path = path[len(function_prefix):] or '/'
+    # Log the request
+    logger.info(f"Request: {method} {path}")
+    
+    # Determine the actual Flask route path
+    flask_path = path
+    
+    # Remove function prefix if present
+    if path.startswith('/.netlify/functions/index'):
+        flask_path = path[len('/.netlify/functions/index'):] or '/'
     elif path.startswith('/api/'):
-        path = path[4:] or '/'
+        flask_path = path[4:] or '/'
     
-    logger.info(f"Extracted path: {path}")
+    # If path is empty, use root
+    if not flask_path:
+        flask_path = '/'
     
-    # If path is root, serve the HTML
-    if path == '/' or path == '':
-        try:
-            # Try to read the static file
-            static_path = os.path.join(os.path.dirname(__file__), 'static', 'index.html')
-            if os.path.exists(static_path):
-                with open(static_path, 'r') as f:
-                    html_content = f.read()
-                return {
-                    'statusCode': 200,
-                    'headers': {
-                        'Access-Control-Allow-Origin': '*',
-                        'Content-Type': 'text/html'
-                    },
-                    'body': html_content
-                }
-            else:
-                # Return a minimal HTML page
-                return {
-                    'statusCode': 200,
-                    'headers': {
-                        'Access-Control-Allow-Origin': '*',
-                        'Content-Type': 'text/html'
-                    },
-                    'body': '<html><body><h1>PocketOption Signal Bot</h1><p>Deployed on Netlify</p></body></html>'
-                }
-        except Exception as e:
-            logger.error(f"Error serving HTML: {e}")
-            return {
-                'statusCode': 500,
-                'headers': {
-                    'Access-Control-Allow-Origin': '*',
-                    'Content-Type': 'application/json'
-                },
-                'body': json.dumps({'error': f'Error serving HTML: {str(e)}'})
-            }
+    logger.info(f"Flask path: {flask_path}")
     
     # Create request context for Flask
     with app.test_request_context(
-        path=path,
+        path=flask_path,
         method=method,
         headers=headers,
         data=body if body else None
@@ -487,9 +469,12 @@ def handler(event, context):
             
             # Get response data
             response_data = response.get_data(as_text=True)
+            status_code = response.status_code
+            
+            logger.info(f"Response status: {status_code}, content type: {response.content_type}")
             
             return {
-                'statusCode': response.status_code,
+                'statusCode': status_code,
                 'headers': {
                     'Access-Control-Allow-Origin': '*',
                     'Content-Type': response.content_type or 'application/json'
@@ -498,6 +483,8 @@ def handler(event, context):
             }
         except Exception as e:
             logger.error(f"Handler error: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
             return {
                 'statusCode': 500,
                 'headers': {
