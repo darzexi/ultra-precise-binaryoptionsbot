@@ -483,7 +483,7 @@
     </div>
 
     <script>
-        const API_BASE = '/.netlify/functions/index';
+        const API_BASE = '';
         let isRunning = false;
         let updateInterval = null;
         let lastManualTriggerTime = 0;
@@ -577,7 +577,7 @@
 
             addLog('⚡ Triggering manual signal...', 'manual');
 
-            fetch(API_BASE + '/manual', {
+            fetch('/.netlify/functions/index/manual', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' }
                 })
@@ -635,7 +635,7 @@
                 trade_expiration: parseInt(tradeExpiration.value) || 60
             };
 
-            fetch(API_BASE + '/start', {
+            fetch('/.netlify/functions/index/start', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify(config)
@@ -675,7 +675,7 @@
 
         // Stop bot
         stopBtn.addEventListener('click', function() {
-            fetch(API_BASE + '/stop', { method: 'POST' })
+            fetch('/.netlify/functions/index/stop', { method: 'POST' })
                 .then(r => r.json())
                 .then(data => {
                     if (data.success) {
@@ -753,7 +753,7 @@
         function startPolling() {
             if (updateInterval) clearInterval(updateInterval);
             updateInterval = setInterval(() => {
-                fetch(API_BASE + '/signal')
+                fetch('/.netlify/functions/index/signal')
                     .then(r => r.json())
                     .then(data => {
                         if (data.signal && data.signal !== 'pending') {
