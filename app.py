@@ -7,17 +7,17 @@ import os
 import logging
 import gc
 import requests
-from datetime import datetime, timedelta
+from datetime import datetime
 from flask import Flask, render_template_string, request, jsonify
 import numpy as np
 
-# Try to import PocketOption
+# Import PocketOption with timeout handling
 try:
     from BinaryOptionsToolsV2.pocketoption import PocketOptionAsync
     POCKET_OPTION_AVAILABLE = True
 except ImportError:
     POCKET_OPTION_AVAILABLE = False
-    logging.warning("BinaryOptionsToolsV2 not available")
+    print("⚠️ BinaryOptionsToolsV2 not found. Install: pip install BinaryOptionsToolsV2")
 
 # ==================== CONFIGURATION ====================
 logging.getLogger('werkzeug').setLevel(logging.ERROR)
@@ -62,16 +62,85 @@ signal_data = {
     'manual_triggered': False,
     'connection_status': 'disconnected',
     'consecutive_failures': 0,
-    'candle_history': []
+    'candle_history': [],
+    'use_rest_fallback': False
 }
 
 trading_client = None
 signal_thread = None
 update_lock = threading.Lock()
-event_loop = None
+rest_session = None
 
 logging.basicConfig(level=logging.ERROR if not DEBUG_MODE else logging.INFO)
 logger = logging.getLogger(__name__)
+
+# ==================== REST API HELPER ====================
+class PocketOptionREST:
+    """REST API fallback for PocketOption"""
+    
+    def __init__(self, ssid):
+        self.ssid = ssid
+        self.session = requests.Session()
+        self.session.cookies.set('ssid', ssid)
+        self.session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Accept': 'application/json',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Referer': 'https://pocketoption.com/en/'
+        })
+        self.base_url = 'https://pocketoption.com'
+    
+    def get_current_price(self, asset):
+        """Get current price via REST API"""
+        try:
+            # Try main endpoint
+            response = self.session.get(
+                f'{self.base_url}/api/trade/current-price',
+                params={'asset': asset},
+                timeout=5
+            )
+            if response.status_code == 200:
+                data = response.json()
+                if data.get('price'):
+                    return float(data['price'])
+        except:
+            pass
+        
+        # Try alternative endpoint
+        try:
+            response = self.session.get(
+                f'{self.base_url}/api/assets/current-price/{asset}',
+                timeout=5
+            )
+            if response.status_code == 200:
+                data = response.json()
+                if data.get('price'):
+                    return float(data['price'])
+        except:
+            pass
+        
+        return None
+    
+    def get_candles(self, asset, timeframe, count):
+        """Get candles via REST API"""
+        try:
+            response = self.session.get(
+                f'{self.base_url}/api/trade/candles',
+                params={
+                    'asset': asset,
+                    'timeframe': timeframe,
+                    'count': count
+                },
+                timeout=5
+            )
+            if response.status_code == 200:
+                data = response.json()
+                if data.get('candles'):
+                    return data['candles']
+        except:
+            pass
+        
+        return None
 
 # ==================== HTML TEMPLATE ====================
 HTML_TEMPLATE = '''<!DOCTYPE html>
@@ -240,6 +309,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         .log-entry.precise { color: #ffd700; }
         .log-entry.manual { color: #ff9800; font-weight: bold; }
         .log-entry.connection { color: #00bcd4; }
+        .log-entry.fallback { color: #ff9800; }
         .ssid-input {
             margin-top: 15px;
             padding: 10px;
@@ -275,15 +345,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         .candle-open { color: #ffc107; }
         .status-connected { color: #28a745; }
         .status-disconnected { color: #dc3545; }
-        .signal-count {
-            display: flex;
-            justify-content: center;
-            gap: 20px;
-            margin-top: 10px;
-        }
-        .signal-count span { font-weight: bold; }
-        .buy-count { color: #28a745; }
-        .sell-count { color: #dc3545; }
+        .status-fallback { color: #ff9800; }
         @media (max-width: 600px) {
             .settings-grid { grid-template-columns: 1fr; }
             .button-group { flex-direction: column; }
@@ -302,12 +364,6 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             <div class="signal-price" id="signalPrice">Price: --</div>
             <div class="signal-time" id="signalTime">Last Update: --</div>
             <div class="accuracy-badge" id="accuracyBadge">🎯 Live Mode</div>
-            
-            <div class="signal-count">
-                <span>BUY: <span class="buy-count" id="buyCount">0</span></span>
-                <span>SELL: <span class="sell-count" id="sellCount">0</span></span>
-                <span>HOLD: <span id="holdCount">0</span></span>
-            </div>
             
             <div class="candle-progress">
                 <div style="display: flex; justify-content: space-between;">
@@ -407,10 +463,9 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         <div class="status-bar">
             <div class="status-item"><span>Status:</span><span id="statusText">Stopped</span></div>
             <div class="status-item"><span>Connection:</span><span id="connectionStatus" class="status-disconnected">Disconnected</span></div>
-            <div class="status-item"><span>Hotkey:</span><span id="hotkeyDisplay"><span class="hotkey-indicator">space</span></span></div>
             <div class="status-item"><span>Mode:</span><span id="modeDisplay">Automatic</span></div>
+            <div class="status-item"><span>Data Source:</span><span id="dataSourceDisplay">WebSocket</span></div>
             <div class="status-item"><span>SSID:</span><span id="ssidStatus">Not Set</span></div>
-            <div class="status-item"><span>Signals:</span><span id="signalStats">0 BUY | 0 SELL</span></div>
         </div>
 
         <div class="log-area" id="logArea">
@@ -422,7 +477,6 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         let isRunning = false;
         let updateInterval = null;
         let lastManualTriggerTime = 0;
-        let signalCounts = { buy: 0, sell: 0, hold: 0 };
 
         const signalDisplay = document.getElementById('signalDisplay');
         const signalText = document.getElementById('signalText');
@@ -431,13 +485,9 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         const statusText = document.getElementById('statusText');
         const connectionStatus = document.getElementById('connectionStatus');
         const modeDisplay = document.getElementById('modeDisplay');
-        const hotkeyDisplay = document.getElementById('hotkeyDisplay');
+        const dataSourceDisplay = document.getElementById('dataSourceDisplay');
         const ssidStatus = document.getElementById('ssidStatus');
         const logArea = document.getElementById('logArea');
-        const buyCount = document.getElementById('buyCount');
-        const sellCount = document.getElementById('sellCount');
-        const holdCount = document.getElementById('holdCount');
-        const signalStats = document.getElementById('signalStats');
 
         const candleProgressFill = document.getElementById('candleProgressFill');
         const candleProgressText = document.getElementById('candleProgressText');
@@ -464,7 +514,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
 
         hotkeyInput.addEventListener('input', function() {
             const key = this.value.trim() || 'space';
-            hotkeyDisplay.innerHTML = `<span class="hotkey-indicator">${key}</span>`;
+            document.getElementById('hotkeyDisplay').innerHTML = `<span class="hotkey-indicator">${key}</span>`;
         });
 
         testBtn.addEventListener('click', function() {
@@ -487,6 +537,9 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                     ssidStatus.textContent = 'Valid';
                     ssidStatus.style.color = '#28a745';
                     addLog('✅ Connection successful!', 'precise');
+                    if (data.method) {
+                        addLog('📡 Using: ' + data.method, 'connection');
+                    }
                 } else {
                     connectionStatus.textContent = 'Failed ✗';
                     connectionStatus.className = 'status-disconnected';
@@ -599,16 +652,6 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                             signalPrice.textContent = `Price: ${data.price || '--'}`;
                             signalTime.textContent = `Last Update: ${data.timestamp || new Date().toLocaleTimeString()}`;
                             signalDisplay.className = 'signal-display ' + (data.signal === 'buy' ? 'buy' : data.signal === 'sell' ? 'sell' : '');
-                            
-                            // Update counts
-                            if (data.signal === 'buy') signalCounts.buy++;
-                            else if (data.signal === 'sell') signalCounts.sell++;
-                            else signalCounts.hold++;
-                            
-                            buyCount.textContent = signalCounts.buy;
-                            sellCount.textContent = signalCounts.sell;
-                            holdCount.textContent = signalCounts.hold;
-                            signalStats.textContent = `${signalCounts.buy} BUY | ${signalCounts.sell} SELL`;
                         }
                         if (data.candle_data) {
                             const cd = data.candle_data;
@@ -624,10 +667,16 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                             if (data.connection_status === 'connected') {
                                 connectionStatus.textContent = 'Connected ✓';
                                 connectionStatus.className = 'status-connected';
+                            } else if (data.connection_status === 'fallback') {
+                                connectionStatus.textContent = 'Fallback Mode';
+                                connectionStatus.className = 'status-fallback';
                             } else {
                                 connectionStatus.textContent = 'Disconnected ✗';
                                 connectionStatus.className = 'status-disconnected';
                             }
+                        }
+                        if (data.data_source) {
+                            dataSourceDisplay.textContent = data.data_source;
                         }
                     })
                     .catch(err => console.error('Polling error:', err));
@@ -660,7 +709,7 @@ def index():
 
 @app.route('/test_connection', methods=['POST'])
 def test_connection():
-    """Test PocketOption connection using correct methods"""
+    """Test PocketOption connection - tries WebSocket first, then REST"""
     try:
         data = request.json
         ssid = data.get('ssid', '').strip()
@@ -668,48 +717,64 @@ def test_connection():
         if not ssid:
             return jsonify({'success': False, 'error': 'SSID required'})
         
-        if not POCKET_OPTION_AVAILABLE:
-            return jsonify({'success': False, 'error': 'PocketOption library not available'})
+        # Try WebSocket first
+        if POCKET_OPTION_AVAILABLE:
+            try:
+                import asyncio
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                
+                # Try with short timeout
+                po = PocketOptionAsync(ssid=ssid)
+                
+                # Try to get candles using compile_candles
+                try:
+                    candles = loop.run_until_complete(
+                        asyncio.wait_for(po.compile_candles('EURUSD_otc', 60, 3), timeout=5)
+                    )
+                    if candles and len(candles) > 0:
+                        loop.close()
+                        return jsonify({'success': True, 'method': 'WebSocket (compile_candles)'})
+                except asyncio.TimeoutError:
+                    logger.debug("WebSocket compile_candles timeout")
+                except Exception as e:
+                    logger.debug(f"WebSocket compile_candles failed: {e}")
+                
+                # Try history
+                try:
+                    candles = loop.run_until_complete(
+                        asyncio.wait_for(po.history('EURUSD_otc', 60), timeout=5)
+                    )
+                    if candles and len(candles) > 0:
+                        loop.close()
+                        return jsonify({'success': True, 'method': 'WebSocket (history)'})
+                except asyncio.TimeoutError:
+                    logger.debug("WebSocket history timeout")
+                except Exception as e:
+                    logger.debug(f"WebSocket history failed: {e}")
+                
+                loop.close()
+                
+            except Exception as e:
+                logger.debug(f"WebSocket test failed: {e}")
         
-        # Try to connect
-        po = PocketOptionAsync(ssid=ssid)
-        
-        # Try to get candles (most reliable method)
+        # Try REST fallback
         try:
-            import asyncio
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            
-            # Try compile_candles first
-            try:
-                candles = loop.run_until_complete(po.compile_candles('EURUSD_otc', 60, 5))
-                if candles and len(candles) > 0:
-                    loop.close()
-                    return jsonify({'success': True, 'method': 'compile_candles', 'count': len(candles)})
-            except Exception as e:
-                logger.debug(f"compile_candles failed: {e}")
-            
-            # Try history
-            try:
-                candles = loop.run_until_complete(po.history('EURUSD_otc', 60))
-                if candles and len(candles) > 0:
-                    loop.close()
-                    return jsonify({'success': True, 'method': 'history', 'count': len(candles)})
-            except Exception as e:
-                logger.debug(f"history failed: {e}")
-            
-            loop.close()
-            return jsonify({'success': False, 'error': 'Could not fetch data'})
-            
+            rest = PocketOptionREST(ssid)
+            price = rest.get_current_price('EURUSD_otc')
+            if price:
+                return jsonify({'success': True, 'method': 'REST API', 'price': price})
         except Exception as e:
-            return jsonify({'success': False, 'error': str(e)})
+            logger.debug(f"REST test failed: {e}")
+        
+        return jsonify({'success': False, 'error': 'Could not connect. Check SSID.'})
         
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)})
 
 @app.route('/start', methods=['POST'])
 def start_bot():
-    global signal_thread, signal_data, trading_client
+    global signal_thread, signal_data, trading_client, rest_session
     
     with update_lock:
         if signal_data['is_running']:
@@ -720,9 +785,6 @@ def start_bot():
         
         if not ssid:
             return jsonify({'success': False, 'error': 'SSID required'})
-        
-        if not POCKET_OPTION_AVAILABLE:
-            return jsonify({'success': False, 'error': 'PocketOption library not available'})
         
         signal_data.update({
             'ssid': ssid,
@@ -737,19 +799,24 @@ def start_bot():
             'current_signal': None,
             'price_data': None,
             'consecutive_failures': 0,
-            'connection_status': 'connected'
+            'connection_status': 'connected',
+            'use_rest_fallback': False
         })
         
-        # Initialize client
-        try:
-            trading_client = PocketOptionAsync(ssid=ssid)
-            signal_data['connection_status'] = 'connected'
-            logger.info("Client initialized")
-        except Exception as e:
-            logger.error(f"Client init error: {e}")
-            signal_data['connection_status'] = 'disconnected'
-            signal_data['is_running'] = False
-            return jsonify({'success': False, 'error': f'Connection failed: {str(e)}'})
+        # Initialize WebSocket client if available
+        if POCKET_OPTION_AVAILABLE:
+            try:
+                trading_client = PocketOptionAsync(ssid=ssid)
+                signal_data['connection_status'] = 'connected'
+                logger.info("WebSocket client initialized")
+            except Exception as e:
+                logger.warning(f"WebSocket init failed: {e}, using REST fallback")
+                trading_client = None
+                signal_data['use_rest_fallback'] = True
+                signal_data['connection_status'] = 'fallback'
+        
+        # Always initialize REST fallback
+        rest_session = PocketOptionREST(ssid)
         
         signal_thread = threading.Thread(target=run_signal_bot, daemon=True)
         signal_thread.start()
@@ -758,11 +825,12 @@ def start_bot():
 
 @app.route('/stop', methods=['POST'])
 def stop_bot():
-    global signal_data, trading_client
+    global signal_data, trading_client, rest_session
     with update_lock:
         signal_data['is_running'] = False
         signal_data['connection_status'] = 'disconnected'
         trading_client = None
+        rest_session = None
     return jsonify({'success': True})
 
 @app.route('/manual_signal', methods=['POST'])
@@ -800,6 +868,7 @@ def get_signal():
             'timestamp': signal_data.get('last_update'),
             'manual_triggered': signal_data.get('manual_triggered', False),
             'connection_status': signal_data.get('connection_status', 'disconnected'),
+            'data_source': 'WebSocket' if not signal_data.get('use_rest_fallback') else 'REST Fallback',
             'candle_data': {
                 'progress': signal_data.get('candle_progress', 0),
                 'open': signal_data.get('candle_open'),
@@ -815,7 +884,7 @@ def get_signal():
 
 # ==================== CORE LOGIC ====================
 def run_signal_bot():
-    global signal_data, trading_client
+    global signal_data, trading_client, rest_session
     
     logger.info("Signal bot started")
     
@@ -826,10 +895,6 @@ def run_signal_bot():
     current_candle_data = []
     last_signal_time = 0
     consecutive_failures = 0
-    last_candle_fetch = 0
-    
-    # Get initial candle data
-    fetch_initial_candles()
     
     while signal_data['is_running']:
         try:
@@ -845,23 +910,14 @@ def run_signal_bot():
             if price_data is None:
                 consecutive_failures += 1
                 signal_data['consecutive_failures'] = consecutive_failures
-                signal_data['connection_status'] = 'disconnected'
                 if consecutive_failures > 5:
+                    signal_data['connection_status'] = 'disconnected'
                     logger.warning(f"Connection lost ({consecutive_failures} failures)")
-                    # Try to reconnect
-                    try:
-                        if trading_client:
-                            trading_client = PocketOptionAsync(ssid=signal_data.get('ssid'))
-                            signal_data['connection_status'] = 'connected'
-                            consecutive_failures = 0
-                            logger.info("Reconnected")
-                    except:
-                        pass
                 time.sleep(1)
                 continue
             
             consecutive_failures = 0
-            signal_data['connection_status'] = 'connected'
+            signal_data['connection_status'] = 'connected' if not signal_data.get('use_rest_fallback') else 'fallback'
             signal_data['consecutive_failures'] = 0
             
             current_price = price_data.get('price', 0)
@@ -873,7 +929,7 @@ def run_signal_bot():
                 candle_high_price = current_price
                 candle_low_price = current_price
                 candle_start_time = timestamp
-                logger.info(f"New candle started at {current_price}")
+                logger.info(f"New candle started at {current_price:.5f}")
             
             # Update candle extremes
             candle_high_price = max(candle_high_price, current_price)
@@ -885,7 +941,6 @@ def run_signal_bot():
             
             # Check for candle completion
             if elapsed >= timeframe:
-                # Save completed candle
                 current_candle_data.append({
                     'open': candle_open_price,
                     'high': candle_high_price,
@@ -896,9 +951,8 @@ def run_signal_bot():
                 if len(current_candle_data) > 50:
                     current_candle_data.pop(0)
                 
-                logger.info(f"Candle closed: O={candle_open_price:.5f} H={candle_high_price:.5f} L={candle_low_price:.5f} C={current_price:.5f}")
+                logger.info(f"Candle: O={candle_open_price:.5f} H={candle_high_price:.5f} L={candle_low_price:.5f} C={current_price:.5f}")
                 
-                # Reset for new candle
                 candle_open_price = current_price
                 candle_high_price = current_price
                 candle_low_price = current_price
@@ -933,66 +987,11 @@ def run_signal_bot():
             
             last_signal_time = current_time
             
-            # Periodic candle refresh
-            if current_time - last_candle_fetch > 60:
-                fetch_initial_candles()
-                last_candle_fetch = current_time
-            
         except Exception as e:
             logger.error(f"Signal bot error: {e}")
             time.sleep(1)
     
     logger.info("Signal bot stopped")
-
-def fetch_initial_candles():
-    """Fetch initial candle data"""
-    global signal_data, trading_client
-    
-    try:
-        if not trading_client:
-            return
-        
-        asset = signal_data['asset']
-        timeframe = signal_data['timeframe']
-        
-        import asyncio
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        
-        candles = None
-        
-        # Try compile_candles first
-        try:
-            candles = loop.run_until_complete(trading_client.compile_candles(asset, timeframe, 30))
-            if candles and len(candles) >= 10:
-                logger.info(f"Got {len(candles)} candles from compile_candles")
-        except Exception as e:
-            logger.debug(f"compile_candles failed: {e}")
-        
-        # Try history if needed
-        if not candles or len(candles) < 10:
-            try:
-                candles = loop.run_until_complete(trading_client.history(asset, timeframe))
-                if candles and len(candles) >= 10:
-                    logger.info(f"Got {len(candles)} candles from history")
-            except Exception as e:
-                logger.debug(f"history failed: {e}")
-        
-        loop.close()
-        
-        if candles and len(candles) > 0:
-            # Store candle history
-            with update_lock:
-                signal_data['candle_history'] = candles
-                
-                # Set initial candle data from latest
-                latest = candles[-1]
-                signal_data['candle_open'] = latest.get('open')
-                signal_data['candle_high'] = latest.get('max')
-                signal_data['candle_low'] = latest.get('min')
-                
-    except Exception as e:
-        logger.error(f"Initial candle fetch error: {e}")
 
 def generate_signal(current_price, open_price, high_price, low_price, progress, candle_history):
     """Generate signal based on price action"""
@@ -1023,17 +1022,15 @@ def generate_signal(current_price, open_price, high_price, low_price, progress, 
         if len(candle_history) >= 3:
             prev_candle = candle_history[-2]
             if prev_candle:
-                # Bullish breakout
                 if (prev_candle.get('close', 0) < prev_candle.get('open', 0) and 
                     current_price > prev_candle.get('high', 0)):
                     return 'buy'
-                # Bearish breakout
                 if (prev_candle.get('close', 0) > prev_candle.get('open', 0) and 
                     current_price < prev_candle.get('low', 0)):
                     return 'sell'
         
-        # Direction based on current vs open with threshold
-        threshold = 0.0005  # 0.05% threshold
+        # Direction based on current vs open
+        threshold = 0.0005
         if current_price > open_price * (1 + threshold):
             return 'buy'
         elif current_price < open_price * (1 - threshold):
@@ -1046,60 +1043,62 @@ def generate_signal(current_price, open_price, high_price, low_price, progress, 
         return 'hold'
 
 def fetch_current_price():
-    """Fetch real price data using PocketOption methods"""
-    global trading_client, signal_data
-    
-    if not trading_client:
-        logger.debug("No trading client")
-        return None
+    """Fetch price using WebSocket with REST fallback"""
+    global trading_client, signal_data, rest_session
     
     asset = signal_data.get('asset', 'EURUSD_otc')
     
-    try:
-        import asyncio
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        
-        # Try compile_candles first (most reliable)
+    # Try WebSocket first if available
+    if trading_client and POCKET_OPTION_AVAILABLE and not signal_data.get('use_rest_fallback'):
         try:
-            candles = loop.run_until_complete(trading_client.compile_candles(asset, 5, 1))
+            import asyncio
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            
+            # Try compile_candles for latest price
+            try:
+                candles = loop.run_until_complete(
+                    asyncio.wait_for(trading_client.compile_candles(asset, 5, 1), timeout=3)
+                )
+                if candles and len(candles) > 0:
+                    latest = candles[-1]
+                    close_price = float(latest.get('close', 0))
+                    if close_price > 0:
+                        loop.close()
+                        return {'price': close_price, 'timestamp': time.time()}
+            except asyncio.TimeoutError:
+                logger.debug("WebSocket compile_candles timeout, using REST fallback")
+                signal_data['use_rest_fallback'] = True
+                signal_data['connection_status'] = 'fallback'
+            except Exception as e:
+                logger.debug(f"WebSocket compile_candles failed: {e}")
+                signal_data['use_rest_fallback'] = True
+                signal_data['connection_status'] = 'fallback'
+            
+            loop.close()
+        except Exception as e:
+            logger.debug(f"WebSocket fetch failed: {e}")
+            signal_data['use_rest_fallback'] = True
+            signal_data['connection_status'] = 'fallback'
+    
+    # Use REST fallback
+    if rest_session:
+        try:
+            price = rest_session.get_current_price(asset)
+            if price:
+                return {'price': price, 'timestamp': time.time()}
+            
+            # Try candles via REST
+            candles = rest_session.get_candles(asset, 5, 1)
             if candles and len(candles) > 0:
                 latest = candles[-1]
                 close_price = float(latest.get('close', 0))
                 if close_price > 0:
-                    loop.close()
                     return {'price': close_price, 'timestamp': time.time()}
         except Exception as e:
-            logger.debug(f"compile_candles price fetch failed: {e}")
-        
-        # Try get_current_price
-        try:
-            if hasattr(trading_client, 'get_current_price'):
-                price = loop.run_until_complete(trading_client.get_current_price(asset))
-                if price and float(price) > 0:
-                    loop.close()
-                    return {'price': float(price), 'timestamp': time.time()}
-        except Exception as e:
-            logger.debug(f"get_current_price failed: {e}")
-        
-        # Try history as last resort
-        try:
-            history = loop.run_until_complete(trading_client.history(asset, 5))
-            if history and len(history) > 0:
-                latest = history[-1]
-                close_price = float(latest.get('close', 0))
-                if close_price > 0:
-                    loop.close()
-                    return {'price': close_price, 'timestamp': time.time()}
-        except Exception as e:
-            logger.debug(f"history price fetch failed: {e}")
-        
-        loop.close()
-        return None
-        
-    except Exception as e:
-        logger.error(f"Price fetch error: {e}")
-        return None
+            logger.debug(f"REST fetch failed: {e}")
+    
+    return None
 
 # ==================== MAIN ====================
 if __name__ == '__main__':
@@ -1108,6 +1107,7 @@ if __name__ == '__main__':
     print("="*50)
     print(f"Server: http://{HOST}:{PORT}")
     print(f"Library: {'Available' if POCKET_OPTION_AVAILABLE else 'Not Available'}")
+    print("Mode: WebSocket + REST Fallback")
     print("="*50 + "\n")
     
     app.run(host=HOST, port=PORT, debug=DEBUG_MODE, threaded=True)
