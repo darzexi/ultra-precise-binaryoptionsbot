@@ -54,7 +54,8 @@ signal_data = {
     'candle_open': None,
     'candle_start_time': None,
     'manual_triggered': False,
-    'candle_time_remaining': '--'
+    'candle_time_remaining': '--',
+    'initialized': False
 }
 
 trading_client = None
@@ -804,7 +805,7 @@ HTML_TEMPLATE = '''
                         return response.json();
                     })
                     .then(data => {
-                        if (data.signal && data.signal !== 'pending') {
+                        if (data.signal && data.signal !== 'pending' && data.signal !== 'hold') {
                             if (!data.manual_triggered) {
                                 updateSignalDisplay(data);
                             }
@@ -957,7 +958,8 @@ def start_bot():
                 'candle_low': None,
                 'candle_open': None,
                 'candle_start_time': None,
-                'manual_triggered': False
+                'manual_triggered': False,
+                'initialized': False
             })
             
             while not signal_queue.empty():
@@ -1107,13 +1109,20 @@ def run_signal_bot():
     
     logging.info("Starting main signal loop")
     
+    # Force initial price fetch to get started
+    first_run = True
+    
     while signal_data['is_running']:
         try:
             current_time = time.time()
             
             should_update = False
             
-            if not signal_data['manual_mode']:
+            # Update on first run or based on update rate
+            if first_run:
+                should_update = True
+                first_run = False
+            elif not signal_data['manual_mode']:
                 if current_time - last_signal_time >= signal_data['update_rate']:
                     should_update = True
             
@@ -1124,12 +1133,15 @@ def run_signal_bot():
                     current_price = price_data.get('price', 0)
                     timestamp = price_data.get('timestamp', current_time)
                     
+                    # Initialize candle on first price
                     if candle_open_price is None:
                         candle_open_price = current_price
                         candle_high_price = current_price
                         candle_low_price = current_price
                         candle_start_time = timestamp
+                        logging.info(f"Candle initialized at price: {current_price}")
                     
+                    # Update high/low
                     if current_price > candle_high_price:
                         candle_high_price = current_price
                     if current_price < candle_low_price:
@@ -1139,6 +1151,7 @@ def run_signal_bot():
                     elapsed = current_time - candle_start_time
                     progress = min((elapsed / timeframe) * 100, 100)
                     
+                    # New candle
                     if elapsed >= timeframe:
                         candle_open_price = current_price
                         candle_high_price = current_price
@@ -1156,14 +1169,19 @@ def run_signal_bot():
                         
                         if len(current_candle_data) > 50:
                             current_candle_data.pop(0)
+                        
+                        logging.info(f"New candle started at: {current_price}")
                     
+                    # Update signal data
                     with update_lock:
                         signal_data['candle_open'] = candle_open_price
                         signal_data['candle_high'] = candle_high_price
                         signal_data['candle_low'] = candle_low_price
                         signal_data['candle_progress'] = progress
                         signal_data['candle_time_remaining'] = f"{max(0, timeframe - elapsed):.1f}s"
+                        signal_data['price_data'] = current_price
                     
+                    # Generate signal
                     signal = generate_signal_from_candle(
                         current_price,
                         candle_open_price,
@@ -1173,11 +1191,17 @@ def run_signal_bot():
                         current_candle_data
                     )
                     
-                    with update_lock:
-                        signal_data['current_signal'] = signal.get('signal')
-                        signal_data['price_data'] = current_price
-                        signal_data['last_update'] = datetime.now().strftime('%H:%M:%S.%f')[:-3]
-                        
+                    signal_type = signal.get('signal')
+                    if signal_type and signal_type != 'hold':
+                        with update_lock:
+                            signal_data['current_signal'] = signal_type
+                            signal_data['last_update'] = datetime.now().strftime('%H:%M:%S.%f')[:-3]
+                        logging.info(f"Signal generated: {signal_type} at {current_price}")
+                    elif signal_type == 'hold':
+                        # Still update timestamp for hold signals
+                        with update_lock:
+                            signal_data['last_update'] = datetime.now().strftime('%H:%M:%S.%f')[:-3]
+                    
                 last_signal_time = current_time
             
             time.sleep(0.05)
@@ -1196,6 +1220,11 @@ def generate_signal_from_candle(current_price, open_price, high_price, low_price
         trade_expiration = signal_data.get('trade_expiration', 60)
         timeframe = signal_data['timeframe']
         
+        # If no candle data yet, generate a random signal to get started
+        if open_price is None or high_price is None or low_price is None:
+            return {'signal': 'buy' if int(time.time()) % 2 == 0 else 'sell', 'price': current_price}
+        
+        # Check expiration
         if use_expiration:
             elapsed = (progress / 100) * timeframe
             remaining = timeframe - elapsed
@@ -1203,6 +1232,7 @@ def generate_signal_from_candle(current_price, open_price, high_price, low_price
             if remaining < trade_expiration:
                 return {'signal': 'hold', 'price': current_price}
         
+        # Early candle: look at previous candle
         if progress < 10:
             if len(candle_history) >= 2:
                 prev_close = candle_history[-2].get('close', current_price)
@@ -1211,11 +1241,13 @@ def generate_signal_from_candle(current_price, open_price, high_price, low_price
                 elif current_price < prev_close:
                     return {'signal': 'sell', 'price': current_price}
         
+        # Strong momentum signals
         if high_price > open_price * 1.002 and current_price > open_price:
             return {'signal': 'buy', 'price': current_price}
         elif low_price < open_price * 0.998 and current_price < open_price:
             return {'signal': 'sell', 'price': current_price}
         
+        # Breakout signals from previous candle
         if len(candle_history) >= 3:
             last_candle = candle_history[-1]
             prev_candle = candle_history[-2]
@@ -1229,16 +1261,18 @@ def generate_signal_from_candle(current_price, open_price, high_price, low_price
                     current_price < prev_candle.get('low', 0)):
                     return {'signal': 'sell', 'price': current_price}
         
+        # Simple trend following
         if current_price > open_price:
             return {'signal': 'buy', 'price': current_price}
         elif current_price < open_price:
             return {'signal': 'sell', 'price': current_price}
         else:
+            # Equal price - random but consistent
             return {'signal': 'buy' if int(time.time()) % 2 == 0 else 'sell', 'price': current_price}
             
     except Exception as e:
         logging.error(f"Signal generation error: {e}")
-        if current_price > open_price:
+        if open_price and current_price > open_price:
             return {'signal': 'buy', 'price': current_price}
         else:
             return {'signal': 'sell', 'price': current_price}
@@ -1246,19 +1280,21 @@ def generate_signal_from_candle(current_price, open_price, high_price, low_price
 def fetch_current_price():
     global trading_client, signal_data
     
+    # If no trading client, use mock data
     if trading_client is None or not HAS_TRADING_LIB:
         return generate_mock_price()
     
     try:
         asset = signal_data['asset']
         
+        # Try different methods to get price
         try:
             if hasattr(trading_client, 'get_current_price'):
                 price = asyncio.run(trading_client.get_current_price(asset))
                 if price:
                     return {'price': price, 'timestamp': time.time()}
-        except:
-            pass
+        except Exception as e:
+            logging.debug(f"get_current_price failed: {e}")
         
         try:
             candles = asyncio.run(trading_client.get_candles(asset, 1, 1))
@@ -1268,8 +1304,8 @@ def fetch_current_price():
                     'price': latest.get('close', 0),
                     'timestamp': latest.get('time', time.time())
                 }
-        except:
-            pass
+        except Exception as e:
+            logging.debug(f"get_candles failed: {e}")
         
         try:
             history = asyncio.run(trading_client.history(asset, 1))
@@ -1279,9 +1315,10 @@ def fetch_current_price():
                     'price': latest.get('close', 0),
                     'timestamp': latest.get('time', time.time())
                 }
-        except:
-            pass
+        except Exception as e:
+            logging.debug(f"history failed: {e}")
         
+        # Fallback to mock data if all methods fail
         return generate_mock_price()
         
     except Exception as e:
@@ -1289,11 +1326,44 @@ def fetch_current_price():
         return generate_mock_price()
 
 def generate_mock_price():
+    """Generate realistic mock price data with random walk"""
     asset = signal_data.get('asset', 'EURUSD_otc')
-    base_price = 1.2000 if 'EURUSD' in asset else 1.0000
     
-    movement = np.random.normal(0, 0.0002)
+    # Base prices for different assets
+    if 'EURUSD' in asset:
+        base_price = 1.2000
+        volatility = 0.0002
+    elif 'GBPUSD' in asset:
+        base_price = 1.3000
+        volatility = 0.0003
+    elif 'USDJPY' in asset:
+        base_price = 150.00
+        volatility = 0.05
+    elif 'BTCUSD' in asset:
+        base_price = 65000
+        volatility = 100
+    elif 'ETHUSD' in asset:
+        base_price = 3500
+        volatility = 10
+    elif 'XAUUSD' in asset:
+        base_price = 2400
+        volatility = 2
+    elif 'XAGUSD' in asset:
+        base_price = 30
+        volatility = 0.1
+    else:
+        base_price = 1.0000
+        volatility = 0.0002
+    
+    # Random walk
+    movement = np.random.normal(0, volatility)
     price = base_price + movement
+    
+    # Ensure price stays within reasonable bounds
+    if price < base_price * 0.95:
+        price = base_price * 0.95
+    if price > base_price * 1.05:
+        price = base_price * 1.05
     
     return {
         'price': price,
