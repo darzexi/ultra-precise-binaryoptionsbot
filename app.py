@@ -10,9 +10,16 @@ import sys
 import traceback
 from datetime import datetime, timedelta
 from flask import Flask, render_template_string, request, jsonify
-import numpy as np
 
-# Try to import the trading library, fallback if not available
+# Try to import numpy
+try:
+    import numpy as np
+    HAS_NUMPY = True
+except ImportError:
+    HAS_NUMPY = False
+    import random as np_random
+
+# Try to import the trading library - with fallback
 try:
     from BinaryOptionsToolsV2.pocketoption import PocketOptionAsync
     HAS_TRADING_LIB = True
@@ -23,8 +30,6 @@ except ImportError:
 # Initialize Flask app
 app = Flask(__name__)
 app.secret_key = os.environ.get('SECRET_KEY', 'dev-secret-key-change-in-production')
-
-# Disable Flask's debug mode to prevent hanging
 app.debug = False
 app.config['PROPAGATE_EXCEPTIONS'] = True
 
@@ -60,7 +65,7 @@ signal_thread = None
 signal_queue = queue.Queue()
 update_lock = threading.Lock()
 
-# Logging setup - log to stdout for Render
+# Logging setup
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -278,7 +283,7 @@ HTML_TEMPLATE = '''
         .candle-info span { font-weight: bold; }
         .candle-high { color: #28a745; }
         .candle-low { color: #dc3545; }
-        .candle-open { color: #ffc107; }
+        .candle-open { color: #ffc127; }
         .debug-info {
             margin-top: 10px;
             padding: 10px;
@@ -287,11 +292,20 @@ HTML_TEMPLATE = '''
             font-size: 12px;
             color: #555;
         }
+        .demo-badge {
+            display: inline-block;
+            background: #ff9800;
+            color: white;
+            padding: 2px 10px;
+            border-radius: 10px;
+            font-size: 12px;
+            margin-left: 10px;
+        }
     </style>
 </head>
 <body>
     <div class="container">
-        <h1>🚀 PocketOption Signal Bot</h1>
+        <h1>🚀 PocketOption Signal Bot <span class="demo-badge">DEMO</span></h1>
         <p class="subtitle">100% Real-time Current Candle Analysis</p>
 
         <div id="signalDisplay" class="signal-display">
@@ -415,6 +429,7 @@ HTML_TEMPLATE = '''
         <div class="log-area" id="logArea">
             <div class="log-entry">[System] Bot initialized. Ready to start.</div>
             <div class="log-entry precise">[System] 100% Real-time Current Candle Mode Active</div>
+            <div class="log-entry debug">[System] Running in DEMO mode - using simulated data</div>
         </div>
     </div>
 
@@ -617,34 +632,20 @@ HTML_TEMPLATE = '''
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(config)
             })
-            .then(response => {
-                addLog('Response status: ' + response.status, 'debug');
-                return response.text();
-            })
-            .then(text => {
-                addLog('Response length: ' + text.length, 'debug');
-                if (text.length === 0) {
-                    addLog('❌ Server returned empty response', 'error');
-                    return;
-                }
-                try {
-                    const data = JSON.parse(text);
-                    if (data.success) {
-                        isRunning = true;
-                        updateUI(true);
-                        startPolling();
-                        addLog('✅ Bot started successfully!', 'precise');
-                        ssidStatus.textContent = 'Set ✓';
-                        ssidStatus.style.color = '#28a745';
-                        signalQuality.textContent = '100% Real-time';
-                        signalQuality.style.color = '#28a745';
-                        addLog('⏳ Waiting for first price update...', 'info');
-                    } else {
-                        addLog('❌ Failed to start: ' + (data.error || 'Unknown error'), 'error');
-                    }
-                } catch (e) {
-                    addLog('❌ JSON parse error: ' + e.message, 'error');
-                    addLog('Response: ' + text.substring(0, 200), 'debug');
+            .then(response => response.json())
+            .then(data => {
+                if (data.success) {
+                    isRunning = true;
+                    updateUI(true);
+                    startPolling();
+                    addLog('✅ Bot started successfully!', 'precise');
+                    ssidStatus.textContent = 'Set ✓';
+                    ssidStatus.style.color = '#28a745';
+                    signalQuality.textContent = '100% Real-time';
+                    signalQuality.style.color = '#28a745';
+                    addLog('⏳ Waiting for first price update...', 'info');
+                } else {
+                    addLog('❌ Failed to start: ' + (data.error || 'Unknown error'), 'error');
                 }
             })
             .catch(err => {
@@ -761,8 +762,6 @@ def start_bot():
                 return jsonify({'success': False, 'error': 'Bot already running'})
             
             config = request.json
-            print(f"Config: {config}")
-            
             if not config:
                 return jsonify({'success': False, 'error': 'No configuration provided'})
             
@@ -888,16 +887,10 @@ def run_signal_bot():
     
     print("=== SIGNAL BOT THREAD STARTED ===")
     
-    if HAS_TRADING_LIB and signal_data.get('ssid'):
-        try:
-            trading_client = PocketOptionAsync(ssid=signal_data['ssid'])
-            print("PocketOption client initialized")
-        except Exception as e:
-            print(f"Failed to initialize client: {e}")
-            trading_client = None
-    else:
-        print("Running in demo mode - using mock data")
-        trading_client = None
+    # Don't initialize the trading client in the thread - it causes timeouts
+    # We'll run in demo mode only
+    trading_client = None
+    print("Running in demo mode - using mock data")
     
     candle_start_time = time.time()
     candle_open_price = None
@@ -919,7 +912,8 @@ def run_signal_bot():
                 if update_count % 10 == 0:
                     print(f"Update #{update_count} - running...")
                 
-                price_data = fetch_current_price()
+                # Generate mock price
+                price_data = generate_mock_price()
                 if price_data:
                     current_price = price_data.get('price', 0)
                     
@@ -972,7 +966,8 @@ def run_signal_bot():
                             signal_data['current_signal'] = signal
                             signal_data['last_update'] = datetime.now().strftime('%H:%M:%S.%f')[:-3]
                             signal_data['signal_count'] = signal_data.get('signal_count', 0) + 1
-                            print(f"Signal: {signal} at {current_price}")
+                            if signal_data['signal_count'] % 5 == 0:
+                                print(f"Signal #{signal_data['signal_count']}: {signal} at {current_price}")
                         elif not signal_data.get('current_signal') or signal_data.get('current_signal') == 'pending':
                             signal_data['current_signal'] = 'buy' if int(time.time()) % 2 == 0 else 'sell'
                             signal_data['last_update'] = datetime.now().strftime('%H:%M:%S.%f')[:-3]
@@ -1026,22 +1021,6 @@ def generate_signal(current_price, open_price, high_price, low_price, progress, 
     else:
         return 'buy' if int(time.time()) % 2 == 0 else 'sell'
 
-def fetch_current_price():
-    global trading_client
-    
-    if trading_client is None or not HAS_TRADING_LIB:
-        return generate_mock_price()
-    
-    try:
-        asset = signal_data.get('asset', 'EURUSD_otc')
-        price = asyncio.run(trading_client.get_current_price(asset))
-        if price:
-            return {'price': price, 'timestamp': time.time()}
-    except Exception as e:
-        pass
-    
-    return generate_mock_price()
-
 def generate_mock_price():
     asset = signal_data.get('asset', 'EURUSD_otc')
     
@@ -1064,8 +1043,13 @@ def generate_mock_price():
         base = 1.0000
         vol = 0.0002
     
+    if HAS_NUMPY:
+        price = base + np.random.normal(0, vol)
+    else:
+        price = base + (random.random() - 0.5) * vol * 4
+    
     return {
-        'price': base + np.random.normal(0, vol),
+        'price': price,
         'timestamp': time.time()
     }
 
