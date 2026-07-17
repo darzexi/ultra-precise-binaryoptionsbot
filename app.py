@@ -2,12 +2,13 @@ import time
 import threading
 import os
 import logging
+import asyncio
 from datetime import datetime
 from flask import Flask, render_template_string, request, jsonify
 
-# Import the synchronous PocketOption
+# Import PocketOption
 try:
-    from BinaryOptionsToolsV2.pocketoption import PocketOption
+    from BinaryOptionsToolsV2.pocketoption import PocketOptionAsync
     POCKET_OPTION_AVAILABLE = True
 except ImportError:
     POCKET_OPTION_AVAILABLE = False
@@ -54,15 +55,26 @@ signal_data = {
     'candle_start_time': None,
     'manual_triggered': False,
     'connection_status': 'disconnected',
-    'consecutive_failures': 0
+    'consecutive_failures': 0,
+    'last_price_fetch': 0
 }
 
-trading_client = None
 signal_thread = None
 update_lock = threading.Lock()
+event_loop = None
 
 logging.basicConfig(level=logging.ERROR if not DEBUG_MODE else logging.INFO)
 logger = logging.getLogger(__name__)
+
+# ==================== HELPER FUNCTIONS ====================
+def run_async(coro):
+    """Run async function in a new event loop"""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        loop.close()
 
 # ==================== HTML TEMPLATE ====================
 HTML_TEMPLATE = '''<!DOCTYPE html>
@@ -291,7 +303,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
 <body>
     <div class="container">
         <h1>🚀 PocketOption Signal Bot</h1>
-        <p class="subtitle">BinaryOptionsToolsV2 - Synchronous Mode</p>
+        <p class="subtitle">Compile Candles Mode - Works on Replit</p>
 
         <div id="signalDisplay" class="signal-display">
             <div style="font-size: 14px; color: #888;">Current Signal</div>
@@ -322,7 +334,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
 
         <div class="ssid-input">
             <label style="font-weight: 600; display: block; margin-bottom: 5px;">PocketOption SSID:</label>
-            <input type="text" id="ssidInput" placeholder="Enter your SSID from cookies" value="r7seffi1r662i33roiengjikcm">
+            <input type="text" id="ssidInput" placeholder="Enter your SSID from cookies" value="">
             <small style="color: #856404; display: block; margin-top: 5px;">
                 💡 Enter just the session value (e.g., r7seffi1r662i33roiengjikcm)
             </small>
@@ -364,7 +376,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             </div>
             <div class="setting-group">
                 <label for="updateRate">Update Rate (seconds)</label>
-                <input type="number" id="updateRate" value="0.5" min="0.1" max="5" step="0.1">
+                <input type="number" id="updateRate" value="1" min="0.5" max="10" step="0.5">
             </div>
             <div class="setting-group">
                 <label>Manual Mode</label>
@@ -377,7 +389,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                 <label>Data Source</label>
                 <div class="checkbox-group">
                     <input type="checkbox" id="websocketMode" disabled>
-                    <label for="websocketMode" style="color: #999;">WebSocket (Synchronous)</label>
+                    <label for="websocketMode" style="color: #999;">Compile Candles</label>
                 </div>
             </div>
             <div class="setting-group">
@@ -409,12 +421,12 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             <div class="status-item"><span>Status:</span><span id="statusText">Stopped</span></div>
             <div class="status-item"><span>Connection:</span><span id="connectionStatus" class="status-disconnected">Disconnected</span></div>
             <div class="status-item"><span>Mode:</span><span id="modeDisplay">Automatic</span></div>
-            <div class="status-item"><span>Data Source:</span><span id="dataSourceDisplay">WebSocket</span></div>
+            <div class="status-item"><span>Data Source:</span><span id="dataSourceDisplay">Compile Candles</span></div>
             <div class="status-item"><span>SSID:</span><span id="ssidStatus">Not Set</span></div>
         </div>
 
         <div class="log-area" id="logArea">
-            <div class="log-entry">[System] Bot initialized. BinaryOptionsToolsV2 Mode.</div>
+            <div class="log-entry">[System] Bot initialized.</div>
             <div class="log-entry connection">💡 Enter your SSID and click Test</div>
         </div>
     </div>
@@ -543,7 +555,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                     ssid: ssid,
                     asset: assetSelect.value,
                     timeframe: parseInt(timeframeSelect.value),
-                    update_rate: parseFloat(updateRate.value) || 0.5,
+                    update_rate: parseFloat(updateRate.value) || 1,
                     manual_mode: manualMode.checked,
                     hotkey: hotkeyInput.value.trim() || 'space',
                     use_expiration: useExpiration.checked,
@@ -656,7 +668,7 @@ def index():
 
 @app.route('/test_connection', methods=['POST'])
 def test_connection():
-    """Test connection using synchronous PocketOption"""
+    """Test connection using compile_candles - no persistent connection"""
     try:
         data = request.json
         ssid = data.get('ssid', '').strip()
@@ -667,57 +679,44 @@ def test_connection():
         if not POCKET_OPTION_AVAILABLE:
             return jsonify({'success': False, 'error': 'BinaryOptionsToolsV2 not installed'})
         
-        # Create synchronous client
-        client = PocketOption(ssid=ssid)
+        # Quick test using compile_candles
+        async def test():
+            try:
+                client = PocketOptionAsync(ssid=ssid)
+                # Try to get candles with short timeout
+                candles = await asyncio.wait_for(
+                    client.compile_candles('EURUSD_otc', 60, 5),
+                    timeout=10
+                )
+                if candles and len(candles) > 0:
+                    # Try to get balance too
+                    try:
+                        balance = await client.balance()
+                    except:
+                        balance = None
+                    
+                    await client.disconnect()
+                    return {
+                        'success': True, 
+                        'price': candles[-1].get('close'),
+                        'balance': balance,
+                        'candle_count': len(candles)
+                    }
+                return {'success': False, 'error': 'No candle data'}
+            except asyncio.TimeoutError:
+                return {'success': False, 'error': 'Connection timeout - SSID may be invalid'}
+            except Exception as e:
+                return {'success': False, 'error': str(e)}
         
-        # Try to get balance (tests connection)
-        try:
-            balance = client.balance()
-            if balance is not None:
-                return jsonify({
-                    'success': True, 
-                    'price': 'N/A',
-                    'balance': balance,
-                    'message': f'Connected! Balance: ${balance}'
-                })
-        except Exception as e:
-            logger.debug(f"Balance check failed: {e}")
-        
-        # Try to get candles as fallback
-        try:
-            candles = client.compile_candles('EURUSD_otc', 60, 5)
-            if candles and len(candles) > 0:
-                return jsonify({
-                    'success': True, 
-                    'price': candles[-1].get('close'),
-                    'message': 'Connected! Got candle data'
-                })
-        except Exception as e:
-            logger.debug(f"Candle fetch failed: {e}")
-        
-        # Try to get server time
-        try:
-            server_time = client.server_time()
-            if server_time:
-                return jsonify({
-                    'success': True, 
-                    'price': 'N/A',
-                    'message': f'Connected! Server time: {server_time}'
-                })
-        except Exception as e:
-            logger.debug(f"Server time failed: {e}")
-        
-        return jsonify({
-            'success': False, 
-            'error': 'Could not connect. Check SSID and try again.'
-        })
+        result = run_async(test())
+        return jsonify(result)
         
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)})
 
 @app.route('/start', methods=['POST'])
 def start_bot():
-    global signal_thread, signal_data, trading_client
+    global signal_thread, signal_data
     
     with update_lock:
         if signal_data['is_running']:
@@ -732,11 +731,27 @@ def start_bot():
         if not POCKET_OPTION_AVAILABLE:
             return jsonify({'success': False, 'error': 'BinaryOptionsToolsV2 not installed'})
         
+        # Validate SSID by testing connection
+        async def validate():
+            try:
+                client = PocketOptionAsync(ssid=ssid)
+                candles = await asyncio.wait_for(
+                    client.compile_candles('EURUSD_otc', 60, 1),
+                    timeout=10
+                )
+                await client.disconnect()
+                return candles is not None and len(candles) > 0
+            except:
+                return False
+        
+        if not run_async(validate()):
+            return jsonify({'success': False, 'error': 'Invalid SSID or connection failed'})
+        
         signal_data.update({
             'ssid': ssid,
             'asset': config.get('asset', 'EURUSD_otc'),
             'timeframe': int(config.get('timeframe', 60)),
-            'update_rate': float(config.get('update_rate', 0.5)),
+            'update_rate': float(config.get('update_rate', 1)),
             'manual_mode': config.get('manual_mode', False),
             'hotkey': config.get('hotkey', 'space'),
             'is_running': True,
@@ -745,18 +760,9 @@ def start_bot():
             'current_signal': None,
             'price_data': None,
             'consecutive_failures': 0,
-            'connection_status': 'connected'
+            'connection_status': 'connected',
+            'last_price_fetch': 0
         })
-        
-        # Initialize synchronous client
-        try:
-            trading_client = PocketOption(ssid=ssid)
-            # Test connection with balance
-            balance = trading_client.balance()
-            logger.info(f"Connected! Balance: ${balance}")
-        except Exception as e:
-            signal_data['is_running'] = False
-            return jsonify({'success': False, 'error': f'Connection error: {str(e)}'})
         
         signal_thread = threading.Thread(target=run_signal_bot, daemon=True)
         signal_thread.start()
@@ -765,16 +771,10 @@ def start_bot():
 
 @app.route('/stop', methods=['POST'])
 def stop_bot():
-    global signal_data, trading_client
+    global signal_data
     with update_lock:
         signal_data['is_running'] = False
         signal_data['connection_status'] = 'disconnected'
-        if trading_client:
-            try:
-                trading_client.disconnect()
-            except:
-                pass
-            trading_client = None
     return jsonify({'success': True})
 
 @app.route('/manual_signal', methods=['POST'])
@@ -826,10 +826,48 @@ def get_signal():
         return jsonify(response)
 
 # ==================== CORE LOGIC ====================
-def run_signal_bot():
-    global signal_data, trading_client
+def fetch_current_price():
+    """Fetch price using compile_candles - connects and disconnects each time"""
+    global signal_data
     
-    logger.info("Signal bot started (Synchronous mode)")
+    ssid = signal_data.get('ssid')
+    asset = signal_data.get('asset', 'EURUSD_otc')
+    
+    if not ssid:
+        return None
+    
+    try:
+        async def get_price():
+            try:
+                client = PocketOptionAsync(ssid=ssid)
+                # Get latest candle
+                candles = await asyncio.wait_for(
+                    client.compile_candles(asset, 5, 1),
+                    timeout=5
+                )
+                await client.disconnect()
+                if candles and len(candles) > 0:
+                    latest = candles[-1]
+                    return {
+                        'price': float(latest.get('close', 0)),
+                        'timestamp': time.time()
+                    }
+                return None
+            except Exception as e:
+                logger.debug(f"Price fetch error: {e}")
+                return None
+        
+        result = run_async(get_price())
+        return result
+        
+    except Exception as e:
+        logger.error(f"Price fetch error: {e}")
+        return None
+
+def run_signal_bot():
+    global signal_data
+    
+    logger.info("Signal bot started")
     
     candle_start_time = time.time()
     candle_open_price = None
@@ -844,7 +882,7 @@ def run_signal_bot():
             current_time = time.time()
             
             if current_time - last_signal_time < signal_data['update_rate']:
-                time.sleep(0.05)
+                time.sleep(0.1)
                 continue
             
             # Fetch current price
@@ -975,30 +1013,6 @@ def generate_signal(current_price, open_price, high_price, low_price, progress, 
         logger.error(f"Signal generation error: {e}")
         return 'hold'
 
-def fetch_current_price():
-    """Fetch price using synchronous PocketOption"""
-    global trading_client, signal_data
-    
-    if not trading_client:
-        return None
-    
-    asset = signal_data.get('asset', 'EURUSD_otc')
-    
-    try:
-        # Try to get candles (most reliable)
-        candles = trading_client.compile_candles(asset, 5, 1)
-        if candles and len(candles) > 0:
-            latest = candles[-1]
-            close_price = float(latest.get('close', 0))
-            if close_price > 0:
-                return {'price': close_price, 'timestamp': time.time()}
-        
-        return None
-        
-    except Exception as e:
-        logger.error(f"Price fetch error: {e}")
-        return None
-
 # ==================== MAIN ====================
 if __name__ == '__main__':
     print("\n" + "="*50)
@@ -1006,7 +1020,7 @@ if __name__ == '__main__':
     print("="*50)
     print(f"Server: http://{HOST}:{PORT}")
     print(f"Library: {'Available' if POCKET_OPTION_AVAILABLE else 'Not Available'}")
-    print("Mode: Synchronous (BinaryOptionsToolsV2)")
+    print("Mode: Compile Candles (Connects per request)")
     print("="*50 + "\n")
     print("💡 To get your SSID:")
     print("1. Log in to pocketoption.com")
