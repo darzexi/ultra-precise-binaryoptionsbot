@@ -52,8 +52,10 @@ signal_thread = None
 signal_queue = queue.Queue()
 update_lock = threading.Lock()
 loop = None
+client_initialized = False
+client_init_lock = threading.Lock()
 
-# HTML template (same as before - keeping it concise for the response)
+# HTML template (keeping it concise for the response)
 HTML_TEMPLATE = '''
 <!DOCTYPE html>
 <html lang="en">
@@ -893,7 +895,7 @@ def index():
 
 @app.route('/start', methods=['POST'])
 def start_bot():
-    global signal_thread, signal_data, trading_client, loop
+    global signal_thread, signal_data, trading_client, loop, client_initialized
     
     with update_lock:
         if signal_data['is_running']:
@@ -946,6 +948,17 @@ def start_bot():
             except Exception as e:
                 logging.error(f"Error creating event loop: {e}")
                 loop = None
+                return jsonify({'success': False, 'error': f'Failed to create event loop: {e}'})
+        
+        # Initialize client before starting thread
+        try:
+            with client_init_lock:
+                trading_client = PocketOptionAsync(ssid=ssid)
+                client_initialized = True
+                logging.info("PocketOption client initialized successfully")
+        except Exception as e:
+            logging.error(f"Failed to initialize client: {e}")
+            return jsonify({'success': False, 'error': f'Failed to initialize client: {e}'})
         
         signal_thread = threading.Thread(target=run_signal_bot, daemon=True)
         signal_thread.start()
@@ -954,10 +967,11 @@ def start_bot():
 
 @app.route('/stop', methods=['POST'])
 def stop_bot():
-    global signal_data, trading_client, loop
+    global signal_data, trading_client, loop, client_initialized
     
     with update_lock:
         signal_data['is_running'] = False
+        client_initialized = False
         
         if trading_client:
             try:
@@ -978,7 +992,7 @@ def stop_bot():
 
 @app.route('/manual_signal', methods=['POST', 'OPTIONS'])
 def manual_signal():
-    global signal_data
+    global signal_data, client_initialized
     
     # Handle OPTIONS request for CORS
     if request.method == 'OPTIONS':
@@ -991,17 +1005,31 @@ def manual_signal():
         if not signal_data['manual_mode']:
             return jsonify({'success': False, 'error': 'Manual mode not enabled'})
         
-        # Get current price
+        if not client_initialized:
+            return jsonify({'success': False, 'error': 'Trading client not ready. Please wait a moment and try again.'})
+        
+        # Get current price from signal_data (updated by the bot thread)
         current_price = signal_data.get('price_data')
-        if current_price is None:
-            price_data = fetch_current_price()
-            if price_data:
-                current_price = price_data.get('price')
         
         # Get candle data
         open_price = signal_data.get('candle_open')
-        if open_price is None:
-            open_price = current_price if current_price else 1.2000
+        
+        # If we don't have data yet, try to fetch it directly
+        if current_price is None or open_price is None:
+            try:
+                price_data = fetch_current_price()
+                if price_data:
+                    current_price = price_data.get('price')
+                    # Try to get open price from the same data or use current as fallback
+                    if open_price is None:
+                        open_price = current_price
+            except Exception as e:
+                logging.warning(f"Could not fetch price for manual signal: {e}")
+                # Use existing data or fallback
+                if current_price is None:
+                    current_price = 1.2000
+                if open_price is None:
+                    open_price = current_price
         
         # Generate manual signal immediately
         if current_price and open_price:
@@ -1061,29 +1089,12 @@ def get_signal():
         return jsonify(response)
 
 def run_signal_bot():
-    global signal_data, trading_client, signal_queue, loop
+    global signal_data, trading_client, signal_queue, loop, client_initialized
     
     logging.info("Signal bot thread started")
     
-    ssid = signal_data.get('ssid')
-    if not ssid:
-        logging.error("No SSID provided")
-        return
-    
-    try:
-        # Ensure event loop exists
-        if loop is None or loop.is_closed():
-            try:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-            except Exception as e:
-                logging.error(f"Failed to create event loop: {e}")
-                return
-        
-        trading_client = PocketOptionAsync(ssid=ssid)
-        logging.info("PocketOption client initialized")
-    except Exception as e:
-        logging.error(f"Failed to initialize client: {e}")
+    if trading_client is None:
+        logging.error("Trading client not initialized")
         return
     
     last_signal_time = 0
@@ -1092,12 +1103,34 @@ def run_signal_bot():
     candle_high_price = None
     candle_low_price = None
     current_candle_data = []
+    first_run = True
     
     logging.info("Starting main signal loop")
     
     while signal_data['is_running']:
         try:
             current_time = time.time()
+            
+            # On first run, try to get initial data immediately
+            if first_run:
+                try:
+                    price_data = fetch_current_price()
+                    if price_data:
+                        current_price = price_data.get('price', 0)
+                        candle_open_price = current_price
+                        candle_high_price = current_price
+                        candle_low_price = current_price
+                        candle_start_time = time.time()
+                        
+                        with update_lock:
+                            signal_data['candle_open'] = candle_open_price
+                            signal_data['candle_high'] = candle_high_price
+                            signal_data['candle_low'] = candle_low_price
+                            signal_data['price_data'] = current_price
+                            signal_data['last_update'] = datetime.now().strftime('%H:%M:%S.%f')[:-3]
+                except Exception as e:
+                    logging.warning(f"Initial price fetch failed: {e}")
+                first_run = False
             
             should_update = False
             
@@ -1106,66 +1139,70 @@ def run_signal_bot():
                     should_update = True
             
             if should_update:
-                price_data = fetch_current_price()
-                
-                if price_data:
-                    current_price = price_data.get('price', 0)
-                    timestamp = price_data.get('timestamp', current_time)
+                try:
+                    price_data = fetch_current_price()
                     
-                    if candle_open_price is None:
-                        candle_open_price = current_price
-                        candle_high_price = current_price
-                        candle_low_price = current_price
-                        candle_start_time = timestamp
-                    
-                    if current_price > candle_high_price:
-                        candle_high_price = current_price
-                    if current_price < candle_low_price:
-                        candle_low_price = current_price
-                    
-                    timeframe = signal_data['timeframe']
-                    elapsed = current_time - candle_start_time
-                    progress = min((elapsed / timeframe) * 100, 100)
-                    
-                    if elapsed >= timeframe:
-                        candle_open_price = current_price
-                        candle_high_price = current_price
-                        candle_low_price = current_price
-                        candle_start_time = current_time
-                        progress = 0
+                    if price_data:
+                        current_price = price_data.get('price', 0)
+                        timestamp = price_data.get('timestamp', current_time)
                         
-                        current_candle_data.append({
-                            'open': candle_open_price,
-                            'high': candle_high_price,
-                            'low': candle_low_price,
-                            'close': current_price,
-                            'time': candle_start_time
-                        })
+                        if candle_open_price is None:
+                            candle_open_price = current_price
+                            candle_high_price = current_price
+                            candle_low_price = current_price
+                            candle_start_time = timestamp
                         
-                        if len(current_candle_data) > 50:
-                            current_candle_data.pop(0)
-                    
-                    with update_lock:
-                        signal_data['candle_open'] = candle_open_price
-                        signal_data['candle_high'] = candle_high_price
-                        signal_data['candle_low'] = candle_low_price
-                        signal_data['candle_progress'] = progress
-                        signal_data['candle_time_remaining'] = f"{max(0, timeframe - elapsed):.1f}s"
-                    
-                    signal = generate_signal_from_candle(
-                        current_price,
-                        candle_open_price,
-                        candle_high_price,
-                        candle_low_price,
-                        progress,
-                        current_candle_data
-                    )
-                    
-                    with update_lock:
-                        signal_data['current_signal'] = signal.get('signal')
-                        signal_data['price_data'] = current_price
-                        signal_data['last_update'] = datetime.now().strftime('%H:%M:%S.%f')[:-3]
+                        if current_price > candle_high_price:
+                            candle_high_price = current_price
+                        if current_price < candle_low_price:
+                            candle_low_price = current_price
                         
+                        timeframe = signal_data['timeframe']
+                        elapsed = current_time - candle_start_time
+                        progress = min((elapsed / timeframe) * 100, 100)
+                        
+                        if elapsed >= timeframe:
+                            candle_open_price = current_price
+                            candle_high_price = current_price
+                            candle_low_price = current_price
+                            candle_start_time = current_time
+                            progress = 0
+                            
+                            current_candle_data.append({
+                                'open': candle_open_price,
+                                'high': candle_high_price,
+                                'low': candle_low_price,
+                                'close': current_price,
+                                'time': candle_start_time
+                            })
+                            
+                            if len(current_candle_data) > 50:
+                                current_candle_data.pop(0)
+                        
+                        with update_lock:
+                            signal_data['candle_open'] = candle_open_price
+                            signal_data['candle_high'] = candle_high_price
+                            signal_data['candle_low'] = candle_low_price
+                            signal_data['candle_progress'] = progress
+                            signal_data['candle_time_remaining'] = f"{max(0, timeframe - elapsed):.1f}s"
+                        
+                        signal = generate_signal_from_candle(
+                            current_price,
+                            candle_open_price,
+                            candle_high_price,
+                            candle_low_price,
+                            progress,
+                            current_candle_data
+                        )
+                        
+                        with update_lock:
+                            signal_data['current_signal'] = signal.get('signal')
+                            signal_data['price_data'] = current_price
+                            signal_data['last_update'] = datetime.now().strftime('%H:%M:%S.%f')[:-3]
+                            
+                except Exception as e:
+                    logging.error(f"Error fetching price in signal loop: {e}")
+                    
                 last_signal_time = current_time
             
             time.sleep(0.05)
