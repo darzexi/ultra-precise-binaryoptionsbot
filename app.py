@@ -7,7 +7,7 @@ import os
 import random
 import logging
 from datetime import datetime, timedelta
-from flask import Flask, render_template_string, request, jsonify, after_this_request
+from flask import Flask, render_template_string, request, jsonify
 import numpy as np
 
 # Try to import the trading library, fallback if not available
@@ -21,6 +21,15 @@ except ImportError:
 # Initialize Flask app
 app = Flask(__name__)
 app.secret_key = os.environ.get('SECRET_KEY', 'dev-secret-key-change-in-production')
+
+# Add proper error handling for JSON responses
+@app.errorhandler(404)
+def not_found(error):
+    return jsonify({'success': False, 'error': 'Not found'}), 404
+
+@app.errorhandler(500)
+def internal_error(error):
+    return jsonify({'success': False, 'error': 'Internal server error'}), 500
 
 # Global variables
 signal_data = {
@@ -59,7 +68,7 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 
-# HTML Template (same as original but with minor fixes)
+# HTML Template (same as original)
 HTML_TEMPLATE = '''
 <!DOCTYPE html>
 <html lang="en">
@@ -670,7 +679,12 @@ HTML_TEMPLATE = '''
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(config)
             })
-            .then(r => r.json())
+            .then(response => {
+                if (!response.ok) {
+                    throw new Error('HTTP error! status: ' + response.status);
+                }
+                return response.json();
+            })
             .then(data => {
                 if (data.success) {
                     isRunning = true;
@@ -692,17 +706,18 @@ HTML_TEMPLATE = '''
                         manualSignalBtn.disabled = true;
                     }
                 } else {
-                    addLog('Failed to start: ' + data.error, 'error');
+                    addLog('Failed to start: ' + (data.error || 'Unknown error'), 'error');
                 }
             })
             .catch(err => {
-                addLog('Error: ' + err.message, 'error');
+                console.error('Start error:', err);
+                addLog('❌ Error: ' + err.message, 'error');
             });
         });
 
         stopBtn.addEventListener('click', function() {
             fetch('/stop', { method: 'POST' })
-                .then(r => r.json())
+                .then(response => response.json())
                 .then(data => {
                     if (data.success) {
                         isRunning = false;
@@ -710,6 +725,9 @@ HTML_TEMPLATE = '''
                         stopPolling();
                         addLog('Bot stopped', 'info');
                     }
+                })
+                .catch(err => {
+                    addLog('❌ Error stopping: ' + err.message, 'error');
                 });
         });
 
@@ -779,7 +797,12 @@ HTML_TEMPLATE = '''
             if (updateInterval) clearInterval(updateInterval);
             updateInterval = setInterval(() => {
                 fetch('/get_signal')
-                    .then(r => r.json())
+                    .then(response => {
+                        if (!response.ok) {
+                            throw new Error('HTTP error! status: ' + response.status);
+                        }
+                        return response.json();
+                    })
                     .then(data => {
                         if (data.signal && data.signal !== 'pending') {
                             if (!data.manual_triggered) {
@@ -790,7 +813,9 @@ HTML_TEMPLATE = '''
                             updateCandleDisplay(data.candle_data);
                         }
                     })
-                    .catch(err => console.error('Polling error:', err));
+                    .catch(err => {
+                        console.error('Polling error:', err);
+                    });
             }, 100);
         }
 
@@ -894,70 +919,81 @@ def index():
 def start_bot():
     global signal_thread, signal_data, trading_client
     
-    with update_lock:
-        if signal_data['is_running']:
-            return jsonify({'success': False, 'error': 'Bot already running'})
-        
-        config = request.json
-        ssid = config.get('ssid', '').strip()
-        
-        if not ssid:
-            return jsonify({'success': False, 'error': 'SSID is required'})
-        
-        trade_exp = int(config.get('trade_expiration', 60))
-        if trade_exp < 3:
-            trade_exp = 3
-        
-        signal_data.update({
-            'ssid': ssid,
-            'asset': config.get('asset', 'EURUSD_otc'),
-            'timeframe': int(config.get('timeframe', 60)),
-            'update_rate': float(config.get('update_rate', 0.5)),
-            'manual_mode': config.get('manual_mode', False),
-            'websocket_mode': config.get('websocket_mode', True),
-            'hotkey': config.get('hotkey', 'space'),
-            'is_running': True,
-            'current_signal': None,
-            'last_update': None,
-            'accuracy_mode': 'precise',
-            'use_expiration': config.get('use_expiration', False),
-            'trade_expiration': trade_exp,
-            'current_candle': None,
-            'candle_progress': 0,
-            'candle_high': None,
-            'candle_low': None,
-            'candle_open': None,
-            'candle_start_time': None,
-            'manual_triggered': False
-        })
-        
-        while not signal_queue.empty():
-            try:
-                signal_queue.get_nowait()
-            except:
-                break
-        
-        signal_thread = threading.Thread(target=run_signal_bot, daemon=True)
-        signal_thread.start()
-        
-        return jsonify({'success': True})
+    try:
+        with update_lock:
+            if signal_data['is_running']:
+                return jsonify({'success': False, 'error': 'Bot already running'})
+            
+            config = request.json
+            if not config:
+                return jsonify({'success': False, 'error': 'No configuration provided'})
+            
+            ssid = config.get('ssid', '').strip()
+            
+            if not ssid:
+                return jsonify({'success': False, 'error': 'SSID is required'})
+            
+            trade_exp = int(config.get('trade_expiration', 60))
+            if trade_exp < 3:
+                trade_exp = 3
+            
+            signal_data.update({
+                'ssid': ssid,
+                'asset': config.get('asset', 'EURUSD_otc'),
+                'timeframe': int(config.get('timeframe', 60)),
+                'update_rate': float(config.get('update_rate', 0.5)),
+                'manual_mode': config.get('manual_mode', False),
+                'websocket_mode': config.get('websocket_mode', True),
+                'hotkey': config.get('hotkey', 'space'),
+                'is_running': True,
+                'current_signal': None,
+                'last_update': None,
+                'accuracy_mode': 'precise',
+                'use_expiration': config.get('use_expiration', False),
+                'trade_expiration': trade_exp,
+                'current_candle': None,
+                'candle_progress': 0,
+                'candle_high': None,
+                'candle_low': None,
+                'candle_open': None,
+                'candle_start_time': None,
+                'manual_triggered': False
+            })
+            
+            while not signal_queue.empty():
+                try:
+                    signal_queue.get_nowait()
+                except:
+                    break
+            
+            signal_thread = threading.Thread(target=run_signal_bot, daemon=True)
+            signal_thread.start()
+            
+            return jsonify({'success': True})
+    except Exception as e:
+        logging.error(f"Start error: {e}")
+        return jsonify({'success': False, 'error': str(e)})
 
 @app.route('/stop', methods=['POST'])
 def stop_bot():
     global signal_data
     
-    with update_lock:
-        signal_data['is_running'] = False
-        
-        global trading_client
-        if trading_client:
-            try:
-                pass
-            except:
-                pass
-            trading_client = None
-        
-        return jsonify({'success': True})
+    try:
+        with update_lock:
+            signal_data['is_running'] = False
+            
+            global trading_client
+            if trading_client:
+                try:
+                    pass
+                except:
+                    pass
+                trading_client = None
+            
+            return jsonify({'success': True})
+    except Exception as e:
+        logging.error(f"Stop error: {e}")
+        return jsonify({'success': False, 'error': str(e)})
 
 @app.route('/manual_signal', methods=['POST', 'OPTIONS'])
 def manual_signal():
@@ -966,72 +1002,80 @@ def manual_signal():
     if request.method == 'OPTIONS':
         return jsonify({'success': True})
     
-    if not signal_data['is_running']:
-        return jsonify({'success': False, 'error': 'Bot not running'})
-    
-    if not signal_data['manual_mode']:
-        return jsonify({'success': False, 'error': 'Manual mode not enabled'})
-    
-    current_price = signal_data.get('price_data')
-    if current_price is None:
-        price_data = fetch_current_price()
-        if price_data:
-            current_price = price_data.get('price')
-    
-    open_price = signal_data.get('candle_open')
-    if open_price is None:
-        open_price = current_price if current_price else 1.2000
-    
-    if current_price and open_price:
-        if current_price > open_price:
-            signal = 'buy'
-        elif current_price < open_price:
-            signal = 'sell'
+    try:
+        if not signal_data['is_running']:
+            return jsonify({'success': False, 'error': 'Bot not running'})
+        
+        if not signal_data['manual_mode']:
+            return jsonify({'success': False, 'error': 'Manual mode not enabled'})
+        
+        current_price = signal_data.get('price_data')
+        if current_price is None:
+            price_data = fetch_current_price()
+            if price_data:
+                current_price = price_data.get('price')
+        
+        open_price = signal_data.get('candle_open')
+        if open_price is None:
+            open_price = current_price if current_price else 1.2000
+        
+        if current_price and open_price:
+            if current_price > open_price:
+                signal = 'buy'
+            elif current_price < open_price:
+                signal = 'sell'
+            else:
+                signal = 'buy' if int(time.time()) % 2 == 0 else 'sell'
         else:
             signal = 'buy' if int(time.time()) % 2 == 0 else 'sell'
-    else:
-        signal = 'buy' if int(time.time()) % 2 == 0 else 'sell'
-        current_price = 1.2000
-    
-    with update_lock:
-        signal_data['current_signal'] = signal
-        signal_data['price_data'] = current_price
-        signal_data['last_update'] = datetime.now().strftime('%H:%M:%S.%f')[:-3]
-        signal_data['manual_triggered'] = True
-    
-    logging.info(f"Manual signal generated: {signal} at {current_price}")
-    
-    return jsonify({'success': True, 'signal': signal, 'price': current_price})
+            current_price = 1.2000
+        
+        with update_lock:
+            signal_data['current_signal'] = signal
+            signal_data['price_data'] = current_price
+            signal_data['last_update'] = datetime.now().strftime('%H:%M:%S.%f')[:-3]
+            signal_data['manual_triggered'] = True
+        
+        logging.info(f"Manual signal generated: {signal} at {current_price}")
+        
+        return jsonify({'success': True, 'signal': signal, 'price': current_price})
+    except Exception as e:
+        logging.error(f"Manual signal error: {e}")
+        return jsonify({'success': False, 'error': str(e)})
 
 @app.route('/get_signal')
 def get_signal():
     global signal_data
     
-    with update_lock:
-        signal = signal_data.get('current_signal')
-        manual_triggered = signal_data.get('manual_triggered', False)
-        
-        response = {
-            'signal': signal,
-            'price': signal_data.get('price_data'),
-            'timestamp': signal_data.get('last_update'),
-            'manual_triggered': manual_triggered,
-            'use_expiration': signal_data.get('use_expiration', False),
-            'trade_expiration': signal_data.get('trade_expiration', 60),
-            'candle_data': {
-                'progress': signal_data.get('candle_progress', 0),
-                'open': signal_data.get('candle_open'),
-                'high': signal_data.get('candle_high'),
-                'low': signal_data.get('candle_low'),
-                'current': signal_data.get('price_data'),
-                'time_remaining': signal_data.get('candle_time_remaining', '--')
-            }
-        }
-        
-        if manual_triggered:
-            signal_data['manual_triggered'] = False
+    try:
+        with update_lock:
+            signal = signal_data.get('current_signal')
+            manual_triggered = signal_data.get('manual_triggered', False)
             
-        return jsonify(response)
+            response = {
+                'signal': signal,
+                'price': signal_data.get('price_data'),
+                'timestamp': signal_data.get('last_update'),
+                'manual_triggered': manual_triggered,
+                'use_expiration': signal_data.get('use_expiration', False),
+                'trade_expiration': signal_data.get('trade_expiration', 60),
+                'candle_data': {
+                    'progress': signal_data.get('candle_progress', 0),
+                    'open': signal_data.get('candle_open'),
+                    'high': signal_data.get('candle_high'),
+                    'low': signal_data.get('candle_low'),
+                    'current': signal_data.get('price_data'),
+                    'time_remaining': signal_data.get('candle_time_remaining', '--')
+                }
+            }
+            
+            if manual_triggered:
+                signal_data['manual_triggered'] = False
+                
+            return jsonify(response)
+    except Exception as e:
+        logging.error(f"Get signal error: {e}")
+        return jsonify({'error': str(e)}), 500
 
 def run_signal_bot():
     global signal_data, trading_client, signal_queue
