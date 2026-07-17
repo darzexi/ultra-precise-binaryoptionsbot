@@ -1,0 +1,865 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PocketOption Signal Bot - 100% Real-time</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            padding: 20px;
+        }
+        .container {
+            background: white;
+            border-radius: 20px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            padding: 30px;
+            max-width: 900px;
+            width: 100%;
+        }
+        h1 {
+            color: #333;
+            margin-bottom: 10px;
+            text-align: center;
+        }
+        .subtitle {
+            text-align: center;
+            color: #666;
+            margin-bottom: 30px;
+        }
+        .signal-display {
+            background: #f8f9fa;
+            border-radius: 15px;
+            padding: 30px;
+            text-align: center;
+            margin-bottom: 30px;
+            border: 3px solid #e0e0e0;
+            transition: all 0.3s ease;
+        }
+        .signal-display.buy {
+            border-color: #28a745;
+            background: #d4edda;
+        }
+        .signal-display.sell {
+            border-color: #dc3545;
+            background: #f8d7da;
+        }
+        .signal-display.manual {
+            border-color: #ff9800;
+            background: #fff3e0;
+        }
+        .signal-text {
+            font-size: 48px;
+            font-weight: bold;
+            margin: 10px 0;
+        }
+        .signal-price {
+            font-size: 20px;
+            color: #555;
+        }
+        .signal-time {
+            font-size: 14px;
+            color: #888;
+            margin-top: 10px;
+        }
+        .accuracy-badge {
+            display: inline-block;
+            background: #28a745;
+            color: white;
+            padding: 5px 15px;
+            border-radius: 20px;
+            font-weight: bold;
+            margin-top: 10px;
+        }
+        .candle-progress {
+            margin-top: 15px;
+            padding: 10px;
+            background: rgba(0,0,0,0.05);
+            border-radius: 10px;
+        }
+        .candle-progress-bar {
+            height: 20px;
+            background: #e9ecef;
+            border-radius: 10px;
+            overflow: hidden;
+            margin-top: 5px;
+        }
+        .candle-progress-fill {
+            height: 100%;
+            background: linear-gradient(90deg, #667eea, #764ba2);
+            transition: width 0.5s ease;
+            border-radius: 10px;
+        }
+        .settings-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 15px;
+            margin-bottom: 20px;
+        }
+        .setting-group {
+            background: #f8f9fa;
+            padding: 15px;
+            border-radius: 10px;
+        }
+        .setting-group label {
+            display: block;
+            font-weight: 600;
+            margin-bottom: 5px;
+            color: #333;
+        }
+        .setting-group input,
+        .setting-group select {
+            width: 100%;
+            padding: 8px 12px;
+            border: 2px solid #ddd;
+            border-radius: 8px;
+            font-size: 14px;
+        }
+        .setting-group input[type="checkbox"] {
+            width: auto;
+            margin-top: 5px;
+        }
+        .checkbox-group {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        .checkbox-group label {
+            margin-bottom: 0;
+        }
+        .button-group {
+            display: flex;
+            gap: 10px;
+            margin-top: 20px;
+            flex-wrap: wrap;
+        }
+        .btn {
+            padding: 10px 25px;
+            border: none;
+            border-radius: 10px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            flex: 1;
+            min-width: 120px;
+        }
+        .btn-success {
+            background: #28a745;
+            color: white;
+        }
+        .btn-success:hover {
+            background: #218838;
+            transform: translateY(-2px);
+        }
+        .btn-danger {
+            background: #dc3545;
+            color: white;
+        }
+        .btn-danger:hover {
+            background: #c82333;
+            transform: translateY(-2px);
+        }
+        .btn-warning {
+            background: #ffc107;
+            color: #333;
+        }
+        .btn-warning:hover {
+            background: #e0a800;
+            transform: translateY(-2px);
+        }
+        .btn-secondary {
+            background: #6c757d;
+            color: white;
+        }
+        .btn-secondary:hover {
+            background: #5a6268;
+            transform: translateY(-2px);
+        }
+        .status-bar {
+            margin-top: 20px;
+            padding: 15px;
+            background: #e9ecef;
+            border-radius: 10px;
+            font-size: 14px;
+        }
+        .status-item {
+            display: flex;
+            justify-content: space-between;
+            padding: 5px 0;
+            border-bottom: 1px solid #dee2e6;
+        }
+        .status-item:last-child {
+            border-bottom: none;
+        }
+        .hotkey-indicator {
+            display: inline-block;
+            background: #333;
+            color: white;
+            padding: 2px 10px;
+            border-radius: 5px;
+            font-weight: bold;
+            margin-left: 5px;
+        }
+        .log-area {
+            margin-top: 20px;
+            background: #1e1e1e;
+            color: #d4d4d4;
+            padding: 15px;
+            border-radius: 10px;
+            max-height: 200px;
+            overflow-y: auto;
+            font-family: 'Courier New', monospace;
+            font-size: 12px;
+        }
+        .log-entry {
+            padding: 2px 0;
+            border-bottom: 1px solid #2d2d2d;
+        }
+        .log-entry.buy {
+            color: #4caf50;
+        }
+        .log-entry.sell {
+            color: #f44336;
+        }
+        .log-entry.error {
+            color: #ff6b6b;
+        }
+        .log-entry.precise {
+            color: #ffd700;
+        }
+        .log-entry.candle {
+            color: #00bcd4;
+        }
+        .log-entry.manual {
+            color: #ff9800;
+            font-weight: bold;
+        }
+        .log-entry.manual-buy {
+            color: #ff9800;
+            font-weight: bold;
+            background: rgba(255, 152, 0, 0.2);
+        }
+        .log-entry.manual-sell {
+            color: #ff9800;
+            font-weight: bold;
+            background: rgba(255, 152, 0, 0.2);
+        }
+        .log-entry.websocket {
+            color: #9b59b6;
+            font-weight: bold;
+        }
+        @media (max-width: 600px) {
+            .settings-grid {
+                grid-template-columns: 1fr;
+            }
+            .button-group {
+                flex-direction: column;
+            }
+            .btn {
+                width: 100%;
+            }
+        }
+        .ssid-input {
+            margin-top: 15px;
+            padding: 10px;
+            background: #fff3cd;
+            border-radius: 10px;
+            border: 1px solid #ffc107;
+        }
+        .ssid-input input {
+            width: 100%;
+            padding: 8px 12px;
+            border: 2px solid #ddd;
+            border-radius: 8px;
+            font-size: 14px;
+            font-family: monospace;
+        }
+        .expiration-input {
+            margin-top: 10px;
+            padding: 10px;
+            background: #e7f3ff;
+            border-radius: 10px;
+            border: 1px solid #b3d9ff;
+        }
+        .expiration-input input {
+            width: 100%;
+            padding: 8px 12px;
+            border: 2px solid #ddd;
+            border-radius: 8px;
+            font-size: 14px;
+        }
+        .candle-info {
+            display: flex;
+            justify-content: space-around;
+            margin-top: 10px;
+            font-size: 14px;
+        }
+        .candle-info span {
+            font-weight: bold;
+        }
+        .candle-high {
+            color: #28a745;
+        }
+        .candle-low {
+            color: #dc3545;
+        }
+        .candle-open {
+            color: #ffc107;
+        }
+        .badge-netlify {
+            display: inline-block;
+            background: #00c7b7;
+            color: white;
+            padding: 2px 10px;
+            border-radius: 10px;
+            font-size: 12px;
+            margin-left: 5px;
+        }
+        .badge-ws {
+            display: inline-block;
+            background: #9b59b6;
+            color: white;
+            padding: 2px 10px;
+            border-radius: 10px;
+            font-size: 12px;
+            margin-left: 5px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🚀 PocketOption Signal Bot <span class="badge-netlify">Netlify</span><span class="badge-ws">WebSocket</span></h1>
+        <p class="subtitle">100% Real-time Current Candle Analysis</p>
+
+        <div id="signalDisplay" class="signal-display">
+            <div style="font-size: 14px; color: #888;">Current Signal</div>
+            <div class="signal-text" id="signalText">WAITING</div>
+            <div class="signal-price" id="signalPrice">Price: --</div>
+            <div class="signal-time" id="signalTime">Last Update: --</div>
+            <div class="accuracy-badge" id="accuracyBadge">🎯 100% Real-time Mode</div>
+
+            <div class="candle-progress">
+                <div style="display: flex; justify-content: space-between;">
+                    <span>Candle Progress</span>
+                    <span id="candleProgressText">0%</span>
+                </div>
+                <div class="candle-progress-bar">
+                    <div class="candle-progress-fill" id="candleProgressFill" style="width: 0%;"></div>
+                </div>
+                <div class="candle-info">
+                    <span class="candle-open">Open: <span id="candleOpen">--</span></span>
+                    <span class="candle-high">High: <span id="candleHigh">--</span></span>
+                    <span class="candle-low">Low: <span id="candleLow">--</span></span>
+                    <span>Current: <span id="candleCurrent">--</span></span>
+                </div>
+                <div style="margin-top: 5px; font-size: 12px; color: #888;">
+                    Time Remaining: <span id="candleTimeRemaining">--</span>
+                </div>
+            </div>
+        </div>
+
+        <div class="ssid-input">
+            <label style="font-weight: 600; display: block; margin-bottom: 5px;">PocketOption SSID:</label>
+            <input type="text" id="ssidInput" placeholder="Enter your SSID from cookies" value="">
+            <small style="color: #856404; display: block; margin-top: 5px;">Get SSID from browser cookies (ssid value)</small>
+        </div>
+
+        <div class="settings-grid">
+            <div class="setting-group">
+                <label for="assetSelect">Asset Symbol</label>
+                <select id="assetSelect">
+                    <option value="EURUSD_otc">EUR/USD OTC</option>
+                    <option value="GBPUSD_otc">GBP/USD OTC</option>
+                    <option value="USDJPY_otc">USD/JPY OTC</option>
+                    <option value="AUDUSD_otc">AUD/USD OTC</option>
+                    <option value="BTCUSD_otc">BTC/USD OTC</option>
+                    <option value="ETHUSD_otc">ETH/USD OTC</option>
+                    <option value="XAUUSD_otc">Gold OTC</option>
+                    <option value="XAGUSD_otc">Silver OTC</option>
+                </select>
+            </div>
+            <div class="setting-group">
+                <label for="timeframeSelect">Candle Timeframe (seconds)</label>
+                <select id="timeframeSelect">
+                    <option value="3">3s</option>
+                    <option value="5">5s</option>
+                    <option value="10">10s</option>
+                    <option value="15">15s</option>
+                    <option value="30">30s</option>
+                    <option value="60" selected>60s</option>
+                    <option value="120">120s</option>
+                    <option value="300">300s</option>
+                </select>
+            </div>
+            <div class="setting-group">
+                <label for="updateRate">Update Rate (seconds)</label>
+                <input type="number" id="updateRate" value="0.5" min="0.1" max="5" step="0.1">
+            </div>
+            <div class="setting-group">
+                <label>Manual Mode</label>
+                <div class="checkbox-group">
+                    <input type="checkbox" id="manualMode">
+                    <label for="manualMode">Enable Manual Signal Update</label>
+                </div>
+            </div>
+            <div class="setting-group">
+                <label>WebSocket Mode</label>
+                <div class="checkbox-group">
+                    <input type="checkbox" id="websocketMode" checked>
+                    <label for="websocketMode">Use Real-time Data</label>
+                </div>
+            </div>
+            <div class="setting-group">
+                <label for="hotkeyInput">Hotkey for Manual Signal</label>
+                <input type="text" id="hotkeyInput" value="space" maxlength="20" placeholder="e.g., space, enter, s">
+            </div>
+        </div>
+
+        <div class="expiration-input">
+            <div class="checkbox-group">
+                <input type="checkbox" id="useExpiration">
+                <label for="useExpiration">Use Trade Expiration Time for Signal Decisions</label>
+            </div>
+            <div style="margin-top: 10px;">
+                <label style="font-weight: 600; display: block; margin-bottom: 5px;">Trade Expiration (seconds):</label>
+                <input type="number" id="tradeExpiration" value="60" min="3" max="300">
+                <small style="color: #666; display: block; margin-top: 5px;">Minimum: 3 seconds</small>
+            </div>
+        </div>
+
+        <div class="button-group">
+            <button class="btn btn-success" id="startBtn">▶ Start Bot</button>
+            <button class="btn btn-danger" id="stopBtn" disabled>⏹ Stop Bot</button>
+            <button class="btn btn-warning" id="manualSignalBtn" disabled>⚡ Manual Signal</button>
+            <button class="btn btn-secondary" id="clearLogsBtn">🗑 Clear Logs</button>
+        </div>
+
+        <div class="status-bar">
+            <div class="status-item">
+                <span>Status:</span>
+                <span id="statusText">Stopped</span>
+            </div>
+            <div class="status-item">
+                <span>Hotkey:</span>
+                <span id="hotkeyDisplay"><span class="hotkey-indicator">space</span></span>
+            </div>
+            <div class="status-item">
+                <span>Mode:</span>
+                <span id="modeDisplay">Automatic</span>
+            </div>
+            <div class="status-item">
+                <span>Data Source:</span>
+                <span id="dataSourceDisplay">WebSocket</span>
+            </div>
+            <div class="status-item">
+                <span>SSID Status:</span>
+                <span id="ssidStatus">Not Set</span>
+            </div>
+            <div class="status-item">
+                <span>Signal Quality:</span>
+                <span id="signalQuality">100% Real-time</span>
+            </div>
+            <div class="status-item">
+                <span>Expiration Mode:</span>
+                <span id="expirationStatus">Disabled</span>
+            </div>
+        </div>
+
+        <div class="log-area" id="logArea">
+            <div class="log-entry">[System] Bot initialized on Netlify. Ready to start.</div>
+            <div class="log-entry precise">[System] 100% Real-time Current Candle Mode Active</div>
+            <div class="log-entry websocket">[System] WebSocket support enabled</div>
+        </div>
+    </div>
+
+    <script>
+        const API_BASE = '/.netlify/functions/index';
+        let isRunning = false;
+        let updateInterval = null;
+        let lastManualTriggerTime = 0;
+
+        // DOM elements
+        const signalDisplay = document.getElementById('signalDisplay');
+        const signalText = document.getElementById('signalText');
+        const signalPrice = document.getElementById('signalPrice');
+        const signalTime = document.getElementById('signalTime');
+        const statusText = document.getElementById('statusText');
+        const modeDisplay = document.getElementById('modeDisplay');
+        const dataSourceDisplay = document.getElementById('dataSourceDisplay');
+        const hotkeyDisplay = document.getElementById('hotkeyDisplay');
+        const ssidStatus = document.getElementById('ssidStatus');
+        const logArea = document.getElementById('logArea');
+        const signalQuality = document.getElementById('signalQuality');
+        const expirationStatus = document.getElementById('expirationStatus');
+
+        const candleProgressFill = document.getElementById('candleProgressFill');
+        const candleProgressText = document.getElementById('candleProgressText');
+        const candleOpen = document.getElementById('candleOpen');
+        const candleHigh = document.getElementById('candleHigh');
+        const candleLow = document.getElementById('candleLow');
+        const candleCurrent = document.getElementById('candleCurrent');
+        const candleTimeRemaining = document.getElementById('candleTimeRemaining');
+
+        const startBtn = document.getElementById('startBtn');
+        const stopBtn = document.getElementById('stopBtn');
+        const manualSignalBtn = document.getElementById('manualSignalBtn');
+        const clearLogsBtn = document.getElementById('clearLogsBtn');
+
+        const ssidInput = document.getElementById('ssidInput');
+        const assetSelect = document.getElementById('assetSelect');
+        const timeframeSelect = document.getElementById('timeframeSelect');
+        const updateRate = document.getElementById('updateRate');
+        const manualMode = document.getElementById('manualMode');
+        const websocketMode = document.getElementById('websocketMode');
+        const hotkeyInput = document.getElementById('hotkeyInput');
+        const useExpiration = document.getElementById('useExpiration');
+        const tradeExpiration = document.getElementById('tradeExpiration');
+
+        // Update hotkey display
+        hotkeyInput.addEventListener('input', function() {
+            const key = this.value.trim() || 'space';
+            hotkeyDisplay.innerHTML = `<span class="hotkey-indicator">${key}</span>`;
+        });
+
+        // Expiration checkbox handler
+        useExpiration.addEventListener('change', function() {
+            tradeExpiration.disabled = !this.checked;
+            if (this.checked) {
+                expirationStatus.textContent = 'Enabled (' + tradeExpiration.value + 's)';
+                expirationStatus.style.color = '#28a745';
+                addLog('Trade expiration mode enabled - ' + tradeExpiration.value + 's', 'precise');
+            } else {
+                expirationStatus.textContent = 'Disabled';
+                expirationStatus.style.color = '#888';
+                addLog('Trade expiration mode disabled', 'info');
+            }
+        });
+
+        tradeExpiration.addEventListener('input', function() {
+            if (useExpiration.checked) {
+                let val = parseInt(this.value) || 60;
+                if (val < 3) val = 3;
+                expirationStatus.textContent = 'Enabled (' + val + 's)';
+                addLog('Trade expiration updated to ' + val + 's', 'info');
+            }
+        });
+
+        // Manual signal button
+        manualSignalBtn.addEventListener('click', function() {
+            if (!isRunning) {
+                addLog('Bot is not running!', 'error');
+                return;
+            }
+            if (!manualMode.checked) {
+                addLog('⚠️ Manual mode is not enabled!', 'error');
+                return;
+            }
+            triggerManualSignal();
+        });
+
+        function triggerManualSignal() {
+            const now = Date.now();
+            if (now - lastManualTriggerTime < 500) {
+                addLog('⏱️ Please wait...', 'manual');
+                return;
+            }
+            lastManualTriggerTime = now;
+
+            addLog('⚡ Triggering manual signal...', 'manual');
+
+            fetch(API_BASE + '/manual', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' }
+                })
+                .then(response => {
+                    if (!response.ok) {
+                        throw new Error('HTTP error! status: ' + response.status);
+                    }
+                    return response.json();
+                })
+                .then(data => {
+                    console.log('Manual signal response:', data);
+                    if (data.success) {
+                        const signal = data.signal;
+                        const price = data.price || '--';
+                        const timestamp = new Date().toLocaleTimeString();
+
+                        signalText.textContent = signal.toUpperCase();
+                        signalPrice.textContent = `Price: ${price}`;
+                        signalTime.textContent = `Last Update: ${timestamp}`;
+
+                        signalDisplay.className = 'signal-display manual';
+                        modeDisplay.textContent = 'Manual (Triggered)';
+                        modeDisplay.style.color = '#ff9800';
+
+                        addLog('✅ MANUAL ' + signal.toUpperCase() + ' at ' + price, 'manual-' + signal);
+                    } else {
+                        addLog('❌ Manual signal failed: ' + data.error, 'error');
+                    }
+                })
+                .catch(err => {
+                    console.error('Manual signal error:', err);
+                    addLog('❌ Error: ' + err.message, 'error');
+                });
+        }
+
+        // Start bot
+        startBtn.addEventListener('click', function() {
+            const ssid = ssidInput.value.trim();
+            if (!ssid) {
+                addLog('ERROR: Please enter your SSID first!', 'error');
+                ssidStatus.textContent = 'Missing!';
+                ssidStatus.style.color = '#dc3545';
+                return;
+            }
+
+            const config = {
+                ssid: ssid,
+                asset: assetSelect.value,
+                timeframe: parseInt(timeframeSelect.value),
+                update_rate: parseFloat(updateRate.value) || 0.5,
+                manual_mode: manualMode.checked,
+                websocket_mode: websocketMode.checked,
+                hotkey: hotkeyInput.value.trim() || 'space',
+                use_expiration: useExpiration.checked,
+                trade_expiration: parseInt(tradeExpiration.value) || 60
+            };
+
+            fetch(API_BASE + '/start', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(config)
+                })
+                .then(r => r.json())
+                .then(data => {
+                    if (data.success) {
+                        isRunning = true;
+                        updateUI(true);
+                        addLog('Bot started successfully - 100% Real-time Current Candle Mode', 'precise');
+                        if (websocketMode.checked) {
+                            addLog('🔌 WebSocket mode enabled - Real-time data', 'websocket');
+                        }
+                        startPolling();
+                        ssidStatus.textContent = 'Set ✓';
+                        ssidStatus.style.color = '#28a745';
+                        signalQuality.textContent = '100% Real-time';
+                        signalQuality.style.color = '#28a745';
+                        if (useExpiration.checked) {
+                            expirationStatus.textContent = 'Enabled (' + tradeExpiration.value + 's)';
+                            expirationStatus.style.color = '#28a745';
+                        }
+                        if (manualMode.checked) {
+                            addLog('🟡 Manual mode is enabled - Use the button or hotkey to trigger signals', 'manual');
+                            manualSignalBtn.disabled = false;
+                        } else {
+                            manualSignalBtn.disabled = true;
+                        }
+                    } else {
+                        addLog('Failed to start: ' + data.error, 'error');
+                    }
+                })
+                .catch(err => {
+                    addLog('Error: ' + err.message, 'error');
+                });
+        });
+
+        // Stop bot
+        stopBtn.addEventListener('click', function() {
+            fetch(API_BASE + '/stop', { method: 'POST' })
+                .then(r => r.json())
+                .then(data => {
+                    if (data.success) {
+                        isRunning = false;
+                        updateUI(false);
+                        stopPolling();
+                        addLog('Bot stopped', 'info');
+                    }
+                });
+        });
+
+        // Clear logs
+        clearLogsBtn.addEventListener('click', function() {
+            logArea.innerHTML = '';
+            addLog('Logs cleared', 'info');
+        });
+
+        function updateUI(running) {
+            startBtn.disabled = running;
+            stopBtn.disabled = !running;
+            if (running && manualMode.checked) {
+                manualSignalBtn.disabled = false;
+            } else {
+                manualSignalBtn.disabled = true;
+            }
+            ssidInput.disabled = running;
+            assetSelect.disabled = running;
+            timeframeSelect.disabled = running;
+            updateRate.disabled = running;
+            manualMode.disabled = running;
+            websocketMode.disabled = running;
+            hotkeyInput.disabled = running;
+            useExpiration.disabled = running;
+            tradeExpiration.disabled = running || !useExpiration.checked;
+
+            if (running) {
+                statusText.textContent = 'Running';
+                statusText.style.color = '#28a745';
+                modeDisplay.textContent = manualMode.checked ? 'Manual' : 'Automatic';
+                dataSourceDisplay.textContent = websocketMode.checked ? 'WebSocket' : 'Historical';
+                hotkeyDisplay.innerHTML = `<span class="hotkey-indicator">${hotkeyInput.value.trim() || 'space'}</span>`;
+            } else {
+                statusText.textContent = 'Stopped';
+                statusText.style.color = '#dc3545';
+                signalDisplay.className = 'signal-display';
+                signalText.textContent = 'WAITING';
+                signalPrice.textContent = 'Price: --';
+                signalTime.textContent = 'Last Update: --';
+                signalQuality.textContent = '100% Real-time';
+                signalQuality.style.color = '#28a745';
+
+                candleProgressFill.style.width = '0%';
+                candleProgressText.textContent = '0%';
+                candleOpen.textContent = '--';
+                candleHigh.textContent = '--';
+                candleLow.textContent = '--';
+                candleCurrent.textContent = '--';
+                candleTimeRemaining.textContent = '--';
+            }
+        }
+
+        manualMode.addEventListener('change', function() {
+            if (isRunning) {
+                if (this.checked) {
+                    manualSignalBtn.disabled = false;
+                    addLog('🟡 Manual mode enabled', 'manual');
+                } else {
+                    manualSignalBtn.disabled = true;
+                    addLog('Manual mode disabled', 'info');
+                }
+                modeDisplay.textContent = this.checked ? 'Manual' : 'Automatic';
+            }
+        });
+
+        function startPolling() {
+            if (updateInterval) clearInterval(updateInterval);
+            updateInterval = setInterval(() => {
+                fetch(API_BASE + '/signal')
+                    .then(r => r.json())
+                    .then(data => {
+                        if (data.signal && data.signal !== 'pending') {
+                            if (!data.manual_triggered) {
+                                updateSignalDisplay(data);
+                            }
+                        }
+                        if (data.candle_data) {
+                            updateCandleDisplay(data.candle_data);
+                        }
+                    })
+                    .catch(err => console.error('Polling error:', err));
+            }, 100);
+        }
+
+        function stopPolling() {
+            if (updateInterval) {
+                clearInterval(updateInterval);
+                updateInterval = null;
+            }
+        }
+
+        function updateSignalDisplay(data) {
+            const signal = data.signal;
+            const price = data.price || '--';
+            const timestamp = data.timestamp || new Date().toLocaleTimeString();
+
+            if (!data.manual_triggered) {
+                signalText.textContent = signal.toUpperCase();
+                signalPrice.textContent = `Price: ${price}`;
+                signalTime.textContent = `Last Update: ${timestamp}`;
+
+                signalDisplay.className = 'signal-display';
+                if (signal === 'buy') {
+                    signalDisplay.classList.add('buy');
+                    addLog(`🟢 BUY signal at ${price}`, 'buy');
+                } else if (signal === 'sell') {
+                    signalDisplay.classList.add('sell');
+                    addLog(`🔴 SELL signal at ${price}`, 'sell');
+                }
+
+                modeDisplay.textContent = manualMode.checked ? 'Manual (Waiting)' : 'Automatic';
+                modeDisplay.style.color = '#333';
+            }
+
+            if (data.use_expiration) {
+                expirationStatus.textContent = 'Enabled (' + data.trade_expiration + 's)';
+                expirationStatus.style.color = '#28a745';
+            }
+        }
+
+        function updateCandleDisplay(candleData) {
+            if (!candleData) return;
+
+            const progress = candleData.progress || 0;
+            const open = candleData.open || '--';
+            const high = candleData.high || '--';
+            const low = candleData.low || '--';
+            const current = candleData.current || '--';
+            const timeRemaining = candleData.time_remaining || '--';
+
+            candleProgressFill.style.width = progress + '%';
+            candleProgressText.textContent = Math.round(progress) + '%';
+            candleOpen.textContent = typeof open === 'number' ? open.toFixed(5) : open;
+            candleHigh.textContent = typeof high === 'number' ? high.toFixed(5) : high;
+            candleLow.textContent = typeof low === 'number' ? low.toFixed(5) : low;
+            candleCurrent.textContent = typeof current === 'number' ? current.toFixed(5) : current;
+            candleTimeRemaining.textContent = timeRemaining;
+        }
+
+        function addLog(message, type = 'info') {
+            const entry = document.createElement('div');
+            entry.className = `log-entry ${type}`;
+            const timestamp = new Date().toLocaleTimeString();
+            entry.textContent = `[${timestamp}] ${message}`;
+            logArea.appendChild(entry);
+            logArea.scrollTop = logArea.scrollHeight;
+        }
+
+        // Keyboard hotkey listener
+        document.addEventListener('keydown', function(e) {
+            if (!isRunning) {
+                return;
+            }
+            if (!manualMode.checked) {
+                return;
+            }
+            const hotkey = hotkeyInput.value.trim() || 'space';
+            const key = e.key.toLowerCase();
+
+            if (key === hotkey.toLowerCase()) {
+                e.preventDefault();
+                addLog('⌨️ Hotkey pressed: ' + hotkey, 'manual');
+                triggerManualSignal();
+            }
+        });
+
+        // Initialize UI
+        updateUI(false);
+        addLog('System ready on Netlify. Enter your SSID and click Start.', 'info');
+        addLog('Hotkey: space (change in settings)', 'info');
+        addLog('🎯 100% Real-time Current Candle Analysis Active', 'precise');
+        addLog('Minimum trade expiration: 3 seconds', 'info');
+        addLog('🔌 WebSocket support enabled for real-time data', 'websocket');
+        ssidStatus.textContent = 'Not Set';
+        ssidStatus.style.color = '#dc3545';
+    </script>
+</body>
+</html>
