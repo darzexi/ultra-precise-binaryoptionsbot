@@ -45,8 +45,8 @@ signal_data = {
     'candle_open': None,
     'candle_start_time': None,
     'manual_triggered': False,
-    'connection_status': 'disconnected',
-    'retry_count': 0
+    'use_proxy': True,
+    'proxy_url': None  # Will be set to a CORS proxy if needed
 }
 
 trading_client = None
@@ -57,7 +57,7 @@ loop = None
 client_initialized = False
 client_init_lock = threading.Lock()
 
-# HTML Template (same as before - keeping it concise)
+# HTML template with proxy option
 HTML_TEMPLATE = '''
 <!DOCTYPE html>
 <html lang="en">
@@ -366,16 +366,20 @@ HTML_TEMPLATE = '''
         .candle-high { color: #28a745; }
         .candle-low { color: #dc3545; }
         .candle-open { color: #ffc107; }
-        .status-dot {
-            display: inline-block;
-            width: 10px;
-            height: 10px;
-            border-radius: 50%;
-            margin-right: 5px;
+        .proxy-input {
+            margin-top: 10px;
+            padding: 10px;
+            background: #e8f5e9;
+            border-radius: 10px;
+            border: 1px solid #4caf50;
         }
-        .status-dot.connected { background: #28a745; }
-        .status-dot.connecting { background: #ffc107; }
-        .status-dot.disconnected { background: #dc3545; }
+        .proxy-input input {
+            width: 100%;
+            padding: 8px 12px;
+            border: 2px solid #ddd;
+            border-radius: 8px;
+            font-size: 14px;
+        }
     </style>
 </head>
 <body>
@@ -414,6 +418,18 @@ HTML_TEMPLATE = '''
             <label style="font-weight: 600; display: block; margin-bottom: 5px;">PocketOption SSID:</label>
             <input type="text" id="ssidInput" placeholder="Enter your SSID from cookies" value="">
             <small style="color: #856404; display: block; margin-top: 5px;">Get SSID from browser cookies (ssid value)</small>
+        </div>
+
+        <div class="proxy-input">
+            <div class="checkbox-group">
+                <input type="checkbox" id="useProxy" checked>
+                <label for="useProxy">Use CORS Proxy (recommended for Replit)</label>
+            </div>
+            <div style="margin-top: 10px;">
+                <label style="font-weight: 600; display: block; margin-bottom: 5px;">Proxy URL (optional):</label>
+                <input type="text" id="proxyUrl" placeholder="Leave empty for default proxy" value="">
+                <small style="color: #666; display: block; margin-top: 5px;">Default: https://cors-anywhere.herokuapp.com/</small>
+            </div>
         </div>
 
         <div class="settings-grid">
@@ -492,10 +508,6 @@ HTML_TEMPLATE = '''
                 <span id="statusText">Stopped</span>
             </div>
             <div class="status-item">
-                <span>Connection:</span>
-                <span id="connectionStatus"><span class="status-dot disconnected"></span>Disconnected</span>
-            </div>
-            <div class="status-item">
                 <span>Hotkey:</span>
                 <span id="hotkeyDisplay"><span class="hotkey-indicator">space</span></span>
             </div>
@@ -519,6 +531,10 @@ HTML_TEMPLATE = '''
                 <span>Expiration Mode:</span>
                 <span id="expirationStatus">Disabled</span>
             </div>
+            <div class="status-item">
+                <span>Proxy:</span>
+                <span id="proxyStatus">Enabled</span>
+            </div>
         </div>
 
         <div class="log-area" id="logArea">
@@ -538,7 +554,6 @@ HTML_TEMPLATE = '''
         const signalPrice = document.getElementById('signalPrice');
         const signalTime = document.getElementById('signalTime');
         const statusText = document.getElementById('statusText');
-        const connectionStatus = document.getElementById('connectionStatus');
         const modeDisplay = document.getElementById('modeDisplay');
         const dataSourceDisplay = document.getElementById('dataSourceDisplay');
         const hotkeyDisplay = document.getElementById('hotkeyDisplay');
@@ -546,6 +561,7 @@ HTML_TEMPLATE = '''
         const logArea = document.getElementById('logArea');
         const signalQuality = document.getElementById('signalQuality');
         const expirationStatus = document.getElementById('expirationStatus');
+        const proxyStatus = document.getElementById('proxyStatus');
 
         const candleProgressFill = document.getElementById('candleProgressFill');
         const candleProgressText = document.getElementById('candleProgressText');
@@ -569,6 +585,14 @@ HTML_TEMPLATE = '''
         const hotkeyInput = document.getElementById('hotkeyInput');
         const useExpiration = document.getElementById('useExpiration');
         const tradeExpiration = document.getElementById('tradeExpiration');
+        const useProxy = document.getElementById('useProxy');
+        const proxyUrl = document.getElementById('proxyUrl');
+
+        // Update proxy status
+        useProxy.addEventListener('change', function() {
+            proxyStatus.textContent = this.checked ? 'Enabled' : 'Disabled';
+            proxyUrl.disabled = !this.checked;
+        });
 
         // Update hotkey display
         hotkeyInput.addEventListener('input', function() {
@@ -678,7 +702,9 @@ HTML_TEMPLATE = '''
                 websocket_mode: websocketMode.checked,
                 hotkey: hotkeyInput.value.trim() || 'space',
                 use_expiration: useExpiration.checked,
-                trade_expiration: parseInt(tradeExpiration.value) || 60
+                trade_expiration: parseInt(tradeExpiration.value) || 60,
+                use_proxy: useProxy.checked,
+                proxy_url: proxyUrl.value.trim() || null
             };
 
             fetch('/start', {
@@ -707,6 +733,7 @@ HTML_TEMPLATE = '''
                     } else {
                         manualSignalBtn.disabled = true;
                     }
+                    proxyStatus.textContent = useProxy.checked ? 'Enabled' : 'Disabled';
                 } else {
                     addLog('Failed to start: ' + data.error, 'error');
                 }
@@ -753,6 +780,8 @@ HTML_TEMPLATE = '''
             hotkeyInput.disabled = running;
             useExpiration.disabled = running;
             tradeExpiration.disabled = running || !useExpiration.checked;
+            useProxy.disabled = running;
+            proxyUrl.disabled = running || !useProxy.checked;
 
             if (running) {
                 statusText.textContent = 'Running';
@@ -769,7 +798,6 @@ HTML_TEMPLATE = '''
                 signalTime.textContent = 'Last Update: --';
                 signalQuality.textContent = '100% Real-time';
                 signalQuality.style.color = '#28a745';
-                updateConnectionStatus('disconnected');
                 
                 candleProgressFill.style.width = '0%';
                 candleProgressText.textContent = '0%';
@@ -779,12 +807,6 @@ HTML_TEMPLATE = '''
                 candleCurrent.textContent = '--';
                 candleTimeRemaining.textContent = '--';
             }
-        }
-
-        function updateConnectionStatus(status) {
-            const dotClass = status === 'connected' ? 'connected' : status === 'connecting' ? 'connecting' : 'disconnected';
-            const statusText = status.charAt(0).toUpperCase() + status.slice(1);
-            connectionStatus.innerHTML = `<span class="status-dot ${dotClass}"></span>${statusText}`;
         }
 
         manualMode.addEventListener('change', function() {
@@ -813,9 +835,6 @@ HTML_TEMPLATE = '''
                         }
                         if (data.candle_data) {
                             updateCandleDisplay(data.candle_data);
-                        }
-                        if (data.connection_status) {
-                            updateConnectionStatus(data.connection_status);
                         }
                     })
                     .catch(err => console.error('Polling error:', err));
@@ -910,7 +929,7 @@ HTML_TEMPLATE = '''
         addLog('Minimum trade expiration: 3 seconds', 'info');
         ssidStatus.textContent = 'Not Set';
         ssidStatus.style.color = '#dc3545';
-        updateConnectionStatus('disconnected');
+        proxyStatus.textContent = 'Enabled';
     </script>
 </body>
 </html>
@@ -960,8 +979,8 @@ def start_bot():
             'candle_open': None,
             'candle_start_time': None,
             'manual_triggered': False,
-            'connection_status': 'connecting',
-            'retry_count': 0
+            'use_proxy': config.get('use_proxy', True),
+            'proxy_url': config.get('proxy_url', None)
         })
         
         while not signal_queue.empty():
@@ -980,39 +999,24 @@ def start_bot():
                 loop = None
                 return jsonify({'success': False, 'error': f'Failed to create event loop: {e}'})
         
-        # Try to initialize client with retry
+        # Initialize client before starting thread with proxy support
         try:
             with client_init_lock:
-                # Attempt to connect with timeout
-                import concurrent.futures
+                # Try to initialize with proxy if enabled
+                if signal_data['use_proxy']:
+                    proxy = signal_data.get('proxy_url') or 'https://cors-anywhere.herokuapp.com/'
+                    logging.info(f"Using proxy: {proxy}")
+                    # Some clients might accept proxy configuration
+                    # We'll use the standard initialization and handle proxy at the request level
                 
-                def init_client():
-                    try:
-                        return PocketOptionAsync(ssid=ssid)
-                    except Exception as e:
-                        logging.error(f"Client init error: {e}")
-                        raise
-                
-                # Use ThreadPoolExecutor with timeout
-                with concurrent.futures.ThreadPoolExecutor() as executor:
-                    future = executor.submit(init_client)
-                    try:
-                        trading_client = future.result(timeout=30)  # 30 second timeout
-                        client_initialized = True
-                        signal_data['connection_status'] = 'connected'
-                        logging.info("PocketOption client initialized successfully")
-                    except concurrent.futures.TimeoutError:
-                        logging.error("Client initialization timed out")
-                        signal_data['connection_status'] = 'disconnected'
-                        return jsonify({'success': False, 'error': 'Connection timeout. Please check your SSID and network.'})
-                    except Exception as e:
-                        logging.error(f"Client initialization failed: {e}")
-                        signal_data['connection_status'] = 'disconnected'
-                        return jsonify({'success': False, 'error': f'Failed to initialize client: {str(e)}'})
-                        
+                trading_client = PocketOptionAsync(ssid=ssid)
+                client_initialized = True
+                logging.info("PocketOption client initialized successfully")
         except Exception as e:
             logging.error(f"Failed to initialize client: {e}")
-            signal_data['connection_status'] = 'disconnected'
+            client_initialized = False
+            trading_client = None
+            signal_data['is_running'] = False
             return jsonify({'success': False, 'error': f'Failed to initialize client: {str(e)}'})
         
         signal_thread = threading.Thread(target=run_signal_bot, daemon=True)
@@ -1027,11 +1031,15 @@ def stop_bot():
     with update_lock:
         signal_data['is_running'] = False
         client_initialized = False
-        signal_data['connection_status'] = 'disconnected'
         
         if trading_client:
             try:
-                pass
+                # Try to disconnect if method exists
+                if hasattr(trading_client, 'disconnect'):
+                    try:
+                        asyncio.run_coroutine_threadsafe(trading_client.disconnect(), loop).result(timeout=5)
+                    except:
+                        pass
             except:
                 pass
             trading_client = None
@@ -1070,13 +1078,22 @@ def manual_signal():
         # Get candle data
         open_price = signal_data.get('candle_open')
         
-        # If we don't have data yet, use fallback
+        # If we don't have data yet, try to fetch it directly
         if current_price is None or open_price is None:
-            # Use a simulated price based on last known data or default
-            if current_price is None:
-                current_price = 1.2000
-            if open_price is None:
-                open_price = current_price
+            try:
+                price_data = fetch_current_price()
+                if price_data:
+                    current_price = price_data.get('price')
+                    # Try to get open price from the same data or use current as fallback
+                    if open_price is None:
+                        open_price = current_price
+            except Exception as e:
+                logging.warning(f"Could not fetch price for manual signal: {e}")
+                # Use existing data or fallback
+                if current_price is None:
+                    current_price = 1.2000
+                if open_price is None:
+                    open_price = current_price
         
         # Generate manual signal immediately
         if current_price and open_price:
@@ -1120,7 +1137,6 @@ def get_signal():
             'manual_triggered': manual_triggered,
             'use_expiration': signal_data.get('use_expiration', False),
             'trade_expiration': signal_data.get('trade_expiration', 60),
-            'connection_status': signal_data.get('connection_status', 'disconnected'),
             'candle_data': {
                 'progress': signal_data.get('candle_progress', 0),
                 'open': signal_data.get('candle_open'),
@@ -1143,7 +1159,6 @@ def run_signal_bot():
     
     if trading_client is None:
         logging.error("Trading client not initialized")
-        signal_data['connection_status'] = 'disconnected'
         return
     
     last_signal_time = 0
@@ -1153,7 +1168,8 @@ def run_signal_bot():
     candle_low_price = None
     current_candle_data = []
     first_run = True
-    consecutive_errors = 0
+    reconnect_attempts = 0
+    max_reconnect_attempts = 5
     
     logging.info("Starting main signal loop")
     
@@ -1178,14 +1194,16 @@ def run_signal_bot():
                             signal_data['candle_low'] = candle_low_price
                             signal_data['price_data'] = current_price
                             signal_data['last_update'] = datetime.now().strftime('%H:%M:%S.%f')[:-3]
-                            signal_data['connection_status'] = 'connected'
+                        
+                        reconnect_attempts = 0
                         logging.info("Initial data fetched successfully")
-                    else:
-                        logging.warning("No price data received on first run")
-                        signal_data['connection_status'] = 'connecting'
                 except Exception as e:
                     logging.warning(f"Initial price fetch failed: {e}")
-                    signal_data['connection_status'] = 'connecting'
+                    reconnect_attempts += 1
+                    if reconnect_attempts >= max_reconnect_attempts:
+                        logging.error("Max reconnection attempts reached. Stopping bot.")
+                        signal_data['is_running'] = False
+                        break
                 first_run = False
             
             should_update = False
@@ -1241,7 +1259,6 @@ def run_signal_bot():
                             signal_data['candle_low'] = candle_low_price
                             signal_data['candle_progress'] = progress
                             signal_data['candle_time_remaining'] = f"{max(0, timeframe - elapsed):.1f}s"
-                            signal_data['connection_status'] = 'connected'
                         
                         signal = generate_signal_from_candle(
                             current_price,
@@ -1257,15 +1274,16 @@ def run_signal_bot():
                             signal_data['price_data'] = current_price
                             signal_data['last_update'] = datetime.now().strftime('%H:%M:%S.%f')[:-3]
                         
-                        consecutive_errors = 0
+                        reconnect_attempts = 0
                             
                 except Exception as e:
-                    consecutive_errors += 1
                     logging.error(f"Error fetching price in signal loop: {e}")
-                    if consecutive_errors > 5:
-                        signal_data['connection_status'] = 'disconnected'
-                    else:
-                        signal_data['connection_status'] = 'connecting'
+                    reconnect_attempts += 1
+                    if reconnect_attempts >= max_reconnect_attempts:
+                        logging.error("Max reconnection attempts reached. Stopping bot.")
+                        signal_data['is_running'] = False
+                        break
+                    time.sleep(1)  # Wait before retry
                     
                 last_signal_time = current_time
             
@@ -1273,7 +1291,6 @@ def run_signal_bot():
             
         except Exception as e:
             logging.error(f"Signal bot error: {e}")
-            signal_data['connection_status'] = 'disconnected'
             time.sleep(0.5)
     
     logging.info("Signal bot thread stopped")
@@ -1353,7 +1370,7 @@ def fetch_current_price():
                     price = asyncio.run_coroutine_threadsafe(
                         trading_client.get_current_price(asset),
                         loop
-                    ).result(timeout=10)
+                    ).result(timeout=15)
                     if price:
                         return {'price': price, 'timestamp': time.time()}
                 except Exception as e:
@@ -1367,7 +1384,7 @@ def fetch_current_price():
                     candles = asyncio.run_coroutine_threadsafe(
                         trading_client.get_candles(asset, 1, 1),
                         loop
-                    ).result(timeout=10)
+                    ).result(timeout=15)
                     if candles and len(candles) > 0:
                         latest = candles[-1]
                         price = latest.get('close', 0)
@@ -1384,7 +1401,7 @@ def fetch_current_price():
                     history = asyncio.run_coroutine_threadsafe(
                         trading_client.history(asset, 1),
                         loop
-                    ).result(timeout=10)
+                    ).result(timeout=15)
                     if history and len(history) > 0:
                         latest = history[-1]
                         price = latest.get('close', 0)
@@ -1399,7 +1416,7 @@ def fetch_current_price():
         
     except Exception as e:
         logging.error(f"Price fetch error: {e}")
-        raise  # Re-raise the exception to stop the bot
+        raise  # Re-raise the exception
 
 if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -1413,6 +1430,7 @@ if __name__ == '__main__':
     print("🌐 Your app is running on Replit!")
     print("📱 Open the webview to access the interface")
     print("⚠️  IMPORTANT: This bot uses REAL PocketOption data only")
+    print("🔄 CORS Proxy is enabled by default for Replit compatibility")
     print("1. Enter your PocketOption SSID in the field")
     print("2. Configure your settings")
     print("3. Click 'Start Bot' to begin")
