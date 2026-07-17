@@ -2,6 +2,7 @@ import asyncio
 import json
 import time
 import threading
+import multiprocessing
 import queue
 import os
 import random
@@ -62,10 +63,10 @@ signal_data = {
 }
 
 trading_client = None
-signal_thread = None
+signal_process = None
+signal_queue = multiprocessing.Queue()
 update_lock = threading.Lock()
 bot_running = False
-loop = None
 
 # Log library status
 if HAS_TRADING_LIB:
@@ -765,12 +766,12 @@ def status():
     return jsonify({
         'has_library': HAS_TRADING_LIB,
         'is_running': signal_data['is_running'],
-        'thread_alive': signal_thread is not None and signal_thread.is_alive() if signal_thread else False
+        'process_alive': signal_process is not None and signal_process.is_alive() if signal_process else False
     })
 
 @app.route('/start', methods=['POST'])
 def start_bot():
-    global signal_thread, signal_data, bot_running, loop
+    global signal_process, signal_data, bot_running
     
     try:
         logger.info("=== START REQUEST RECEIVED ===")
@@ -789,10 +790,6 @@ def start_bot():
         trade_exp = int(config.get('trade_expiration', 60))
         if trade_exp < 3:
             trade_exp = 3
-        
-        # Create event loop for this thread
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
         
         with update_lock:
             signal_data.update({
@@ -821,10 +818,13 @@ def start_bot():
         
         bot_running = True
         
-        # Start the thread
-        signal_thread = threading.Thread(target=run_signal_bot, daemon=True)
-        signal_thread.start()
-        logger.info(f"Thread started, alive: {signal_thread.is_alive()}")
+        # Start the process
+        signal_process = multiprocessing.Process(
+            target=run_signal_bot,
+            args=(signal_data.copy(),)
+        )
+        signal_process.start()
+        logger.info(f"Process started, pid: {signal_process.pid}")
         
         logger.info("=== START SUCCESS ===")
         return jsonify({'success': True})
@@ -836,7 +836,7 @@ def start_bot():
 
 @app.route('/stop', methods=['POST'])
 def stop_bot():
-    global signal_data, trading_client, bot_running, loop, signal_thread
+    global signal_data, bot_running, signal_process
     
     try:
         logger.info("=== STOP REQUEST RECEIVED ===")
@@ -845,21 +845,16 @@ def stop_bot():
             bot_running = False
             signal_data['is_running'] = False
             signal_data['current_signal'] = None
-            trading_client = None
         
-        # Wait for thread to finish
-        if signal_thread and signal_thread.is_alive():
-            logger.info("Waiting for thread to finish...")
-            signal_thread.join(timeout=2.0)
+        # Terminate process
+        if signal_process and signal_process.is_alive():
+            logger.info("Terminating process...")
+            signal_process.terminate()
+            signal_process.join(timeout=3.0)
+            if signal_process.is_alive():
+                signal_process.kill()
         
-        if loop:
-            try:
-                loop.close()
-            except:
-                pass
-            loop = None
-        
-        signal_thread = None
+        signal_process = None
         
         logger.info("=== STOP SUCCESS ===")
         return jsonify({'success': True})
@@ -925,22 +920,28 @@ def get_signal():
 
 # ==================== BOT LOGIC ====================
 
-def run_signal_bot():
-    global signal_data, trading_client, bot_running, loop
+def run_signal_bot(config_data):
+    """Run the signal bot in a separate process."""
+    global signal_data
     
-    logger.info("=== SIGNAL BOT THREAD STARTED ===")
+    # Copy config data to local variables
+    asset = config_data.get('asset', 'EURUSD_otc')
+    timeframe = config_data.get('timeframe', 60)
+    update_rate = config_data.get('update_rate', 0.5)
+    ssid = config_data.get('ssid', '')
+    use_expiration = config_data.get('use_expiration', False)
+    trade_expiration = config_data.get('trade_expiration', 60)
+    
+    logger.info("=== SIGNAL BOT PROCESS STARTED ===")
     logger.info(f"HAS_TRADING_LIB: {HAS_TRADING_LIB}")
-    logger.info(f"SSID: {signal_data.get('ssid', 'None')[:20]}...")
+    logger.info(f"Asset: {asset}, Timeframe: {timeframe}s, Update Rate: {update_rate}s")
     
-    # Initialize trading client with proper async handling
-    if HAS_TRADING_LIB and signal_data.get('ssid'):
+    # Initialize trading client (with error handling)
+    trading_client = None
+    if HAS_TRADING_LIB and ssid:
         try:
-            if loop is None:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-            
-            # Initialize the client
-            trading_client = PocketOptionAsync(ssid=signal_data['ssid'])
+            logger.info("Initializing PocketOption client...")
+            trading_client = PocketOptionAsync(ssid=ssid)
             logger.info("✅ PocketOption client initialized successfully")
         except Exception as e:
             logger.error(f"❌ Failed to initialize client: {e}")
@@ -961,13 +962,18 @@ def run_signal_bot():
     
     logger.info("Starting main loop...")
     
-    # Main loop
-    while bot_running and signal_data['is_running']:
+    # Main loop - use a local copy of signal_data for updates
+    while True:
         try:
+            # Check if we should exit
+            if not signal_data.get('is_running', False):
+                break
+            
             current_time = time.time()
             
             # Check if we should update
-            should_update = first_run or (current_time - signal_data.get('last_price_update', 0) >= signal_data['update_rate'])
+            last_update = signal_data.get('last_price_update', 0)
+            should_update = first_run or (current_time - last_update >= update_rate)
             
             if should_update:
                 first_run = False
@@ -977,7 +983,7 @@ def run_signal_bot():
                     logger.info(f"Update #{update_count}")
                 
                 # Get current price
-                price_data = fetch_current_price()
+                price_data = fetch_current_price(trading_client, asset)
                 
                 if price_data:
                     current_price = price_data.get('price', 0)
@@ -1000,7 +1006,6 @@ def run_signal_bot():
                         candle_low_price = current_price
                     
                     # Calculate progress
-                    timeframe = signal_data['timeframe']
                     elapsed = current_time - candle_start_time
                     progress = min((elapsed / timeframe) * 100, 100)
                     
@@ -1030,10 +1035,13 @@ def run_signal_bot():
                         candle_high_price, 
                         candle_low_price, 
                         progress, 
-                        current_candle_data
+                        current_candle_data,
+                        use_expiration,
+                        trade_expiration,
+                        timeframe
                     )
                     
-                    # Update signal data
+                    # Update signal data (using lock)
                     with update_lock:
                         signal_data['price_data'] = current_price
                         signal_data['candle_open'] = candle_open_price
@@ -1063,20 +1071,18 @@ def run_signal_bot():
             traceback.print_exc()
             time.sleep(1)
     
-    logger.info("=== SIGNAL BOT THREAD STOPPED ===")
+    logger.info("=== SIGNAL BOT PROCESS STOPPED ===")
 
-def generate_signal(current_price, open_price, high_price, low_price, progress, candle_history):
+def generate_signal(current_price, open_price, high_price, low_price, progress, candle_history, use_expiration, trade_expiration, timeframe):
     """Generate a trading signal based on candle data."""
     
     if open_price is None:
         return 'buy' if int(time.time()) % 2 == 0 else 'sell'
     
     # Check expiration
-    if signal_data.get('use_expiration', False):
-        trade_exp = signal_data.get('trade_expiration', 60)
-        timeframe = signal_data['timeframe']
+    if use_expiration:
         remaining = timeframe - (progress / 100) * timeframe
-        if remaining < trade_exp:
+        if remaining < trade_expiration:
             return 'hold'
     
     # Early candle - look at previous close
@@ -1110,24 +1116,20 @@ def generate_signal(current_price, open_price, high_price, low_price, progress, 
     else:
         return 'buy' if int(time.time()) % 2 == 0 else 'sell'
 
-def fetch_current_price():
+def fetch_current_price(trading_client, asset):
     """Fetch current price from PocketOption or generate mock data."""
-    global trading_client, loop
     
     # Always try to get real price first
     if trading_client is not None and HAS_TRADING_LIB:
         try:
-            asset = signal_data.get('asset', 'EURUSD_otc')
-            
-            # Get the event loop
-            if loop is None:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-            
             # Try to get current price
             if hasattr(trading_client, 'get_current_price'):
                 try:
+                    # Create a new event loop for this thread
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
                     price = loop.run_until_complete(trading_client.get_current_price(asset))
+                    loop.close()
                     if price and price > 0:
                         logger.debug(f"✅ Got price from get_current_price: {price}")
                         return {'price': price, 'timestamp': time.time()}
@@ -1137,7 +1139,10 @@ def fetch_current_price():
             # Try candles as fallback
             if hasattr(trading_client, 'get_candles'):
                 try:
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
                     candles = loop.run_until_complete(trading_client.get_candles(asset, 1, 1))
+                    loop.close()
                     if candles and len(candles) > 0:
                         latest = candles[-1]
                         price = latest.get('close', 0)
@@ -1150,7 +1155,10 @@ def fetch_current_price():
             # Try history as fallback
             if hasattr(trading_client, 'history'):
                 try:
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
                     history = loop.run_until_complete(trading_client.history(asset, 1))
+                    loop.close()
                     if history and len(history) > 0:
                         latest = history[-1]
                         price = latest.get('close', 0)
@@ -1166,11 +1174,10 @@ def fetch_current_price():
             logger.warning(f"⚠️ Price fetch error: {e}")
     
     # Fallback to mock data
-    return generate_mock_price()
+    return generate_mock_price(asset)
 
-def generate_mock_price():
+def generate_mock_price(asset):
     """Generate realistic mock price data."""
-    asset = signal_data.get('asset', 'EURUSD_otc')
     
     # Use a seed based on time to make it more realistic
     seed = int(time.time() / 10)
