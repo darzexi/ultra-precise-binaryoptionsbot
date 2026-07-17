@@ -3,5 +3,8 @@
   functions = "api"
   publish = "public"
 
+[build.environment]
+  PYTHON_VERSION = "3.9"
+
 [functions]
-  python_version = "3.9"
+  directory = "api"
