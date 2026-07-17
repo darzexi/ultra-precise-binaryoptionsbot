@@ -8,6 +8,7 @@ from flask import Flask, request, jsonify
 import logging
 import os
 import sys
+import traceback
 
 # Add the current directory to path for imports
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -52,7 +53,8 @@ state = {
     'client': None,
     'signal_thread': None,
     'signal_queue': queue.Queue(),
-    'hotkey': 'space'
+    'hotkey': 'space',
+    'initialized': False
 }
 
 # Lock for thread safety
@@ -104,18 +106,6 @@ def fetch_price(client, asset):
             }
     except Exception as e:
         logger.error(f"Error fetching price: {e}")
-    return None
-
-def get_candles(client, asset, timeframe, count=30):
-    """Fetch candles from the API"""
-    try:
-        if not client:
-            return None
-        candles = run_async(client.get_candles(asset, timeframe, count))
-        if candles and len(candles) > 0:
-            return candles
-    except Exception as e:
-        logger.error(f"Error fetching candles: {e}")
     return None
 
 def generate_signal_from_candle(current_price, open_price, high_price, low_price, progress, candle_history, is_manual=False):
@@ -308,114 +298,131 @@ def run_signal_bot():
 def start():
     global state
     
-    with state_lock:
-        if state.get('is_running', False):
-            return jsonify({'success': False, 'error': 'Bot already running'})
-        
-        config = request.json
-        if not config:
-            return jsonify({'success': False, 'error': 'Invalid JSON body'})
-        
-        ssid = config.get('ssid', '').strip()
-        
-        if not ssid:
-            return jsonify({'success': False, 'error': 'SSID is required'})
-        
-        if not HAS_BINARY_OPTIONS:
-            return jsonify({'success': False, 'error': 'BinaryOptionsToolsV2 not available'})
-        
-        client = get_client(ssid)
-        if not client:
-            return jsonify({'success': False, 'error': 'Failed to connect to PocketOption'})
-        
-        state.update({
-            'ssid': ssid,
-            'asset': config.get('asset', 'EURUSD_otc'),
-            'timeframe': int(config.get('timeframe', 60)),
-            'update_rate': float(config.get('update_rate', 0.5)),
-            'manual_mode': config.get('manual_mode', False),
-            'websocket_mode': config.get('websocket_mode', True),
-            'hotkey': config.get('hotkey', 'space'),
-            'use_expiration': config.get('use_expiration', False),
-            'trade_expiration': int(config.get('trade_expiration', 60)),
-            'is_running': True,
-            'client': client,
-            'candle_open': None,
-            'candle_high': None,
-            'candle_low': None,
-            'candle_start_time': None,
-            'candle_history': []
-        })
-        
-        while not state['signal_queue'].empty():
-            try:
-                state['signal_queue'].get_nowait()
-            except:
-                break
-        
-        signal_thread = threading.Thread(target=run_signal_bot, daemon=True)
-        signal_thread.start()
-        state['signal_thread'] = signal_thread
-        
-        logger.info("Bot started successfully")
-        return jsonify({'success': True})
+    try:
+        with state_lock:
+            if state.get('is_running', False):
+                return jsonify({'success': False, 'error': 'Bot already running'})
+            
+            config = request.get_json(silent=True)
+            if not config:
+                return jsonify({'success': False, 'error': 'Invalid JSON body'})
+            
+            ssid = config.get('ssid', '').strip()
+            
+            if not ssid:
+                return jsonify({'success': False, 'error': 'SSID is required'})
+            
+            if not HAS_BINARY_OPTIONS:
+                return jsonify({'success': False, 'error': 'BinaryOptionsToolsV2 not available'})
+            
+            client = get_client(ssid)
+            if not client:
+                return jsonify({'success': False, 'error': 'Failed to connect to PocketOption'})
+            
+            state.update({
+                'ssid': ssid,
+                'asset': config.get('asset', 'EURUSD_otc'),
+                'timeframe': int(config.get('timeframe', 60)),
+                'update_rate': float(config.get('update_rate', 0.5)),
+                'manual_mode': config.get('manual_mode', False),
+                'websocket_mode': config.get('websocket_mode', True),
+                'hotkey': config.get('hotkey', 'space'),
+                'use_expiration': config.get('use_expiration', False),
+                'trade_expiration': int(config.get('trade_expiration', 60)),
+                'is_running': True,
+                'client': client,
+                'candle_open': None,
+                'candle_high': None,
+                'candle_low': None,
+                'candle_start_time': None,
+                'candle_history': [],
+                'initialized': True
+            })
+            
+            while not state['signal_queue'].empty():
+                try:
+                    state['signal_queue'].get_nowait()
+                except:
+                    break
+            
+            signal_thread = threading.Thread(target=run_signal_bot, daemon=True)
+            signal_thread.start()
+            state['signal_thread'] = signal_thread
+            
+            logger.info("Bot started successfully")
+            return jsonify({'success': True})
+    except Exception as e:
+        logger.error(f"Start error: {e}")
+        return jsonify({'success': False, 'error': str(e)})
 
 @app.route('/stop', methods=['POST'])
 def stop():
     global state
     
-    with state_lock:
-        state['is_running'] = False
-        state['client'] = None
-    
-    return jsonify({'success': True})
+    try:
+        with state_lock:
+            state['is_running'] = False
+            state['client'] = None
+        
+        return jsonify({'success': True})
+    except Exception as e:
+        logger.error(f"Stop error: {e}")
+        return jsonify({'success': False, 'error': str(e)})
 
 @app.route('/manual', methods=['POST'])
 def manual():
     global state
     
-    if not state.get('is_running', False):
-        return jsonify({'success': False, 'error': 'Bot not running'})
-    
-    if not state.get('manual_mode', False):
-        return jsonify({'success': False, 'error': 'Manual mode not enabled'})
-    
-    state['signal_queue'].put({'manual': True, 'timestamp': time.time()})
-    logger.info(f"Manual signal queued")
-    
-    return jsonify({'success': True, 'signal': 'pending', 'price': state.get('price_data', '--')})
+    try:
+        if not state.get('is_running', False):
+            return jsonify({'success': False, 'error': 'Bot not running'})
+        
+        if not state.get('manual_mode', False):
+            return jsonify({'success': False, 'error': 'Manual mode not enabled'})
+        
+        state['signal_queue'].put({'manual': True, 'timestamp': time.time()})
+        logger.info(f"Manual signal queued")
+        
+        return jsonify({'success': True, 'signal': 'pending', 'price': state.get('price_data', '--')})
+    except Exception as e:
+        logger.error(f"Manual error: {e}")
+        return jsonify({'success': False, 'error': str(e)})
 
-@app.route('/signal')
+@app.route('/signal', methods=['GET'])
 def get_signal():
     global state
     
-    with state_lock:
-        signal = state.get('current_signal')
-        manual_triggered = state.get('manual_triggered', False)
-        
-        response = {
-            'signal': signal,
-            'price': state.get('price_data'),
-            'timestamp': state.get('last_update'),
-            'manual_triggered': manual_triggered,
-            'use_expiration': state.get('use_expiration', False),
-            'trade_expiration': state.get('trade_expiration', 60),
-            'candle_data': {
-                'progress': state.get('candle_progress', 0),
-                'open': state.get('candle_open'),
-                'high': state.get('candle_high'),
-                'low': state.get('candle_low'),
-                'current': state.get('price_data'),
-                'time_remaining': state.get('candle_time_remaining', '--')
-            }
-        }
-        
-        if manual_triggered:
-            state['manual_triggered'] = False
+    try:
+        with state_lock:
+            signal = state.get('current_signal')
+            manual_triggered = state.get('manual_triggered', False)
             
-        return jsonify(response)
+            response = {
+                'signal': signal,
+                'price': state.get('price_data'),
+                'timestamp': state.get('last_update'),
+                'manual_triggered': manual_triggered,
+                'use_expiration': state.get('use_expiration', False),
+                'trade_expiration': state.get('trade_expiration', 60),
+                'candle_data': {
+                    'progress': state.get('candle_progress', 0),
+                    'open': state.get('candle_open'),
+                    'high': state.get('candle_high'),
+                    'low': state.get('candle_low'),
+                    'current': state.get('price_data'),
+                    'time_remaining': state.get('candle_time_remaining', '--')
+                }
+            }
+            
+            if manual_triggered:
+                state['manual_triggered'] = False
+                
+            return jsonify(response)
+    except Exception as e:
+        logger.error(f"Signal error: {e}")
+        return jsonify({'success': False, 'error': str(e)})
 
-@app.route('/')
+@app.route('/', methods=['GET'])
 def index():
     return jsonify({'status': 'running', 'message': 'Binary Options Signal Bot API'})
 
@@ -427,7 +434,7 @@ def handler(event, context):
         path = event.get('path', '/')
         
         # Get the path without the function name
-        if path.startswith('/.netlify/functions/index'):
+        if '/.netlify/functions/index' in path:
             path = path.replace('/.netlify/functions/index', '') or '/'
         
         headers = event.get('headers', {})
@@ -436,7 +443,10 @@ def handler(event, context):
         body = event.get('body', '')
         if body and event.get('isBase64Encoded', False):
             import base64
-            body = base64.b64decode(body).decode('utf-8')
+            try:
+                body = base64.b64decode(body).decode('utf-8')
+            except:
+                body = ''
         
         # Handle OPTIONS for CORS
         if method == 'OPTIONS':
@@ -450,21 +460,8 @@ def handler(event, context):
                 'body': ''
             }
         
-        # Parse JSON body for POST requests
-        if method == 'POST' and body:
-            try:
-                request_json = json.loads(body) if body else {}
-            except json.JSONDecodeError:
-                return {
-                    'statusCode': 400,
-                    'headers': {
-                        'Access-Control-Allow-Origin': '*',
-                        'Content-Type': 'application/json'
-                    },
-                    'body': json.dumps({'success': False, 'error': 'Invalid JSON'})
-                }
-        else:
-            request_json = None
+        # Set up environment for Flask
+        os.environ['FLASK_ENV'] = 'production'
         
         # Create a test client and dispatch request
         with app.test_request_context(
@@ -474,9 +471,21 @@ def handler(event, context):
             data=body if body else None,
             content_type=headers.get('Content-Type', 'application/json')
         ):
-            # Set request JSON if available
-            if request_json is not None:
-                request._cached_json = request_json
+            # Parse JSON body for POST requests
+            if method == 'POST' and body:
+                try:
+                    request_json = json.loads(body) if body else {}
+                    request._cached_json = request_json
+                except json.JSONDecodeError as e:
+                    logger.error(f"JSON decode error: {e}")
+                    return {
+                        'statusCode': 400,
+                        'headers': {
+                            'Access-Control-Allow-Origin': '*',
+                            'Content-Type': 'application/json'
+                        },
+                        'body': json.dumps({'success': False, 'error': 'Invalid JSON'})
+                    }
             
             try:
                 # Dispatch the request to Flask
@@ -486,6 +495,12 @@ def handler(event, context):
                 response_data = response.get_data(as_text=True)
                 if not response_data:
                     response_data = json.dumps({'success': False, 'error': 'Empty response'})
+                
+                # Ensure we have valid JSON
+                try:
+                    json.loads(response_data)
+                except:
+                    response_data = json.dumps({'success': False, 'error': 'Invalid response format'})
                 
                 return {
                     'statusCode': response.status_code,
@@ -497,6 +512,7 @@ def handler(event, context):
                 }
             except Exception as e:
                 logger.error(f"Error processing request: {e}")
+                logger.error(traceback.format_exc())
                 return {
                     'statusCode': 500,
                     'headers': {
@@ -508,6 +524,7 @@ def handler(event, context):
                 
     except Exception as e:
         logger.error(f"Handler error: {e}")
+        logger.error(traceback.format_exc())
         return {
             'statusCode': 500,
             'headers': {
