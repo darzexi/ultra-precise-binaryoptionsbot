@@ -7,6 +7,7 @@ import os
 import random
 import logging
 import sys
+import traceback
 from datetime import datetime, timedelta
 from flask import Flask, render_template_string, request, jsonify
 import numpy as np
@@ -17,11 +18,15 @@ try:
     HAS_TRADING_LIB = True
 except ImportError:
     HAS_TRADING_LIB = False
-    logging.warning("BinaryOptionsToolsV2 not installed - running in demo mode")
+    print("WARNING: BinaryOptionsToolsV2 not installed - running in demo mode")
 
 # Initialize Flask app
 app = Flask(__name__)
 app.secret_key = os.environ.get('SECRET_KEY', 'dev-secret-key-change-in-production')
+
+# Disable Flask's debug mode to prevent hanging
+app.debug = False
+app.config['PROPAGATE_EXCEPTIONS'] = True
 
 # Global variables
 signal_data = {
@@ -55,13 +60,14 @@ signal_thread = None
 signal_queue = queue.Queue()
 update_lock = threading.Lock()
 
-# Logging setup
+# Logging setup - log to stdout for Render
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    stream=sys.stdout
 )
 
-# HTML Template
+# HTML Template (simplified for deployment)
 HTML_TEMPLATE = '''
 <!DOCTYPE html>
 <html lang="en">
@@ -611,8 +617,16 @@ HTML_TEMPLATE = '''
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(config)
             })
-            .then(response => response.text())
+            .then(response => {
+                addLog('Response status: ' + response.status, 'debug');
+                return response.text();
+            })
             .then(text => {
+                addLog('Response length: ' + text.length, 'debug');
+                if (text.length === 0) {
+                    addLog('❌ Server returned empty response', 'error');
+                    return;
+                }
                 try {
                     const data = JSON.parse(text);
                     if (data.success) {
@@ -629,7 +643,8 @@ HTML_TEMPLATE = '''
                         addLog('❌ Failed to start: ' + (data.error || 'Unknown error'), 'error');
                     }
                 } catch (e) {
-                    addLog('❌ Server error: ' + text.substring(0, 100), 'error');
+                    addLog('❌ JSON parse error: ' + e.message, 'error');
+                    addLog('Response: ' + text.substring(0, 200), 'debug');
                 }
             })
             .catch(err => {
@@ -663,12 +678,8 @@ HTML_TEMPLATE = '''
             if (updateInterval) clearInterval(updateInterval);
             updateInterval = setInterval(() => {
                 fetch('/get_signal')
-                .then(response => {
-                    if (!response.ok) throw new Error('HTTP ' + response.status);
-                    return response.json();
-                })
+                .then(response => response.json())
                 .then(data => {
-                    // Update debug info
                     if (data.price) {
                         lastPrice.textContent = typeof data.price === 'number' ? data.price.toFixed(5) : data.price;
                     }
@@ -679,7 +690,6 @@ HTML_TEMPLATE = '''
                         signalCount.textContent = data.signal_count;
                     }
                     
-                    // Update signal
                     if (data.signal && data.signal !== 'pending' && data.signal !== 'hold') {
                         if (!data.manual_triggered) {
                             signalText.textContent = data.signal.toUpperCase();
@@ -691,7 +701,6 @@ HTML_TEMPLATE = '''
                         }
                     }
                     
-                    // Update candle data
                     if (data.candle_data) {
                         const cd = data.candle_data;
                         candleProgressFill.style.width = (cd.progress || 0) + '%';
@@ -704,7 +713,7 @@ HTML_TEMPLATE = '''
                     }
                 })
                 .catch(err => {
-                    // Silently handle polling errors
+                    // Silent fail
                 });
             }, 100);
         }
@@ -745,11 +754,15 @@ def start_bot():
     global signal_thread, signal_data, trading_client
     
     try:
+        print("=== START REQUEST RECEIVED ===")
+        
         with update_lock:
             if signal_data['is_running']:
                 return jsonify({'success': False, 'error': 'Bot already running'})
             
             config = request.json
+            print(f"Config: {config}")
+            
             if not config:
                 return jsonify({'success': False, 'error': 'No configuration provided'})
             
@@ -784,18 +797,23 @@ def start_bot():
                 'signal_count': 0
             })
             
+            # Clear queue
             while not signal_queue.empty():
                 try:
                     signal_queue.get_nowait()
                 except:
                     break
             
+            # Start thread
             signal_thread = threading.Thread(target=run_signal_bot, daemon=True)
             signal_thread.start()
             
+            print("=== START SUCCESS ===")
             return jsonify({'success': True})
+            
     except Exception as e:
-        logging.error(f"Start error: {e}")
+        print(f"=== START ERROR: {e} ===")
+        traceback.print_exc()
         return jsonify({'success': False, 'error': str(e)})
 
 @app.route('/stop', methods=['POST'])
@@ -868,17 +886,17 @@ def get_signal():
 def run_signal_bot():
     global signal_data, trading_client
     
-    logging.info("Signal bot thread started")
+    print("=== SIGNAL BOT THREAD STARTED ===")
     
     if HAS_TRADING_LIB and signal_data.get('ssid'):
         try:
             trading_client = PocketOptionAsync(ssid=signal_data['ssid'])
-            logging.info("PocketOption client initialized")
+            print("PocketOption client initialized")
         except Exception as e:
-            logging.error(f"Failed to initialize client: {e}")
+            print(f"Failed to initialize client: {e}")
             trading_client = None
     else:
-        logging.warning("Running in demo mode - using mock data")
+        print("Running in demo mode - using mock data")
         trading_client = None
     
     candle_start_time = time.time()
@@ -888,6 +906,7 @@ def run_signal_bot():
     last_signal_time = 0
     current_candle_data = []
     first_run = True
+    update_count = 0
     
     while signal_data['is_running']:
         try:
@@ -895,6 +914,10 @@ def run_signal_bot():
             
             if first_run or (current_time - last_signal_time >= signal_data['update_rate']):
                 first_run = False
+                update_count += 1
+                
+                if update_count % 10 == 0:
+                    print(f"Update #{update_count} - running...")
                 
                 price_data = fetch_current_price()
                 if price_data:
@@ -905,7 +928,7 @@ def run_signal_bot():
                         candle_high_price = current_price
                         candle_low_price = current_price
                         candle_start_time = current_time
-                        logging.info(f"Candle initialized at {current_price}")
+                        print(f"Candle initialized at {current_price}")
                     
                     if current_price > candle_high_price:
                         candle_high_price = current_price
@@ -932,6 +955,7 @@ def run_signal_bot():
                         })
                         if len(current_candle_data) > 50:
                             current_candle_data.pop(0)
+                        print(f"New candle at: {current_price}")
                     
                     signal = generate_signal(current_price, candle_open_price, candle_high_price, 
                                             candle_low_price, progress, current_candle_data)
@@ -948,9 +972,8 @@ def run_signal_bot():
                             signal_data['current_signal'] = signal
                             signal_data['last_update'] = datetime.now().strftime('%H:%M:%S.%f')[:-3]
                             signal_data['signal_count'] = signal_data.get('signal_count', 0) + 1
-                            logging.info(f"Signal: {signal} at {current_price}")
+                            print(f"Signal: {signal} at {current_price}")
                         elif not signal_data.get('current_signal') or signal_data.get('current_signal') == 'pending':
-                            # Fallback signal
                             signal_data['current_signal'] = 'buy' if int(time.time()) % 2 == 0 else 'sell'
                             signal_data['last_update'] = datetime.now().strftime('%H:%M:%S.%f')[:-3]
                             signal_data['signal_count'] = signal_data.get('signal_count', 0) + 1
@@ -960,10 +983,11 @@ def run_signal_bot():
             time.sleep(0.1)
             
         except Exception as e:
-            logging.error(f"Signal bot error: {e}")
+            print(f"Signal bot error: {e}")
+            traceback.print_exc()
             time.sleep(0.5)
     
-    logging.info("Signal bot thread stopped")
+    print("=== SIGNAL BOT THREAD STOPPED ===")
 
 def generate_signal(current_price, open_price, high_price, low_price, progress, candle_history):
     if open_price is None:
@@ -1014,7 +1038,7 @@ def fetch_current_price():
         if price:
             return {'price': price, 'timestamp': time.time()}
     except Exception as e:
-        logging.debug(f"Price fetch failed: {e}")
+        pass
     
     return generate_mock_price()
 
