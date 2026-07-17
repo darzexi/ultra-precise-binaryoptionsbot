@@ -16,9 +16,13 @@ import numpy as np
 try:
     from BinaryOptionsToolsV2.pocketoption import PocketOptionAsync
     HAS_TRADING_LIB = True
-except ImportError:
+    print("✅ BinaryOptionsToolsV2 loaded successfully")
+except ImportError as e:
     HAS_TRADING_LIB = False
-    print("WARNING: BinaryOptionsToolsV2 not installed - running in demo mode")
+    print(f"⚠️ BinaryOptionsToolsV2 not installed: {e}")
+except Exception as e:
+    HAS_TRADING_LIB = False
+    print(f"⚠️ Error loading BinaryOptionsToolsV2: {e}")
 
 # Initialize Flask app
 app = Flask(__name__)
@@ -64,7 +68,7 @@ logging.basicConfig(
     stream=sys.stdout
 )
 
-# HTML Template (simplified)
+# HTML Template
 HTML_TEMPLATE = '''
 <!DOCTYPE html>
 <html lang="en">
@@ -273,7 +277,7 @@ HTML_TEMPLATE = '''
         .candle-info span { font-weight: bold; }
         .candle-high { color: #28a745; }
         .candle-low { color: #dc3545; }
-        .candle-open { color: #ffc107; }
+        .candle-open { color: #ffc127; }
         .debug-info {
             margin-top: 10px;
             padding: 10px;
@@ -282,11 +286,20 @@ HTML_TEMPLATE = '''
             font-size: 12px;
             color: #555;
         }
+        .status-badge {
+            display: inline-block;
+            padding: 2px 10px;
+            border-radius: 10px;
+            font-size: 11px;
+            font-weight: bold;
+        }
+        .status-badge.live { background: #28a745; color: white; }
+        .status-badge.demo { background: #ff9800; color: white; }
     </style>
 </head>
 <body>
     <div class="container">
-        <h1>🚀 PocketOption Signal Bot</h1>
+        <h1>🚀 PocketOption Signal Bot <span class="status-badge demo" id="modeBadge">DEMO</span></h1>
         <p class="subtitle">100% Real-time Current Candle Analysis</p>
 
         <div id="signalDisplay" class="signal-display">
@@ -405,6 +418,7 @@ HTML_TEMPLATE = '''
             <div class="status-item"><span>SSID Status:</span><span id="ssidStatus">Not Set</span></div>
             <div class="status-item"><span>Signal Quality:</span><span id="signalQuality">100% Real-time</span></div>
             <div class="status-item"><span>Expiration Mode:</span><span id="expirationStatus">Disabled</span></div>
+            <div class="status-item"><span>Library:</span><span id="libraryStatus">Loading...</span></div>
         </div>
 
         <div class="log-area" id="logArea">
@@ -433,6 +447,7 @@ HTML_TEMPLATE = '''
         const signalCount = document.getElementById('signalCount');
         const lastPrice = document.getElementById('lastPrice');
         const debugOpen = document.getElementById('debugOpen');
+        const libraryStatus = document.getElementById('libraryStatus');
 
         const candleProgressFill = document.getElementById('candleProgressFill');
         const candleProgressText = document.getElementById('candleProgressText');
@@ -446,6 +461,7 @@ HTML_TEMPLATE = '''
         const stopBtn = document.getElementById('stopBtn');
         const manualSignalBtn = document.getElementById('manualSignalBtn');
         const clearLogsBtn = document.getElementById('clearLogsBtn');
+        const modeBadge = document.getElementById('modeBadge');
 
         const ssidInput = document.getElementById('ssidInput');
         const assetSelect = document.getElementById('assetSelect');
@@ -465,6 +481,22 @@ HTML_TEMPLATE = '''
             logArea.appendChild(entry);
             logArea.scrollTop = logArea.scrollHeight;
         }
+
+        // Check library status
+        fetch('/status')
+            .then(r => r.json())
+            .then(data => {
+                if (data.has_library) {
+                    libraryStatus.textContent = '✅ BinaryOptionsToolsV2';
+                    libraryStatus.style.color = '#28a745';
+                    modeBadge.textContent = 'LIVE';
+                    modeBadge.className = 'status-badge live';
+                } else {
+                    libraryStatus.textContent = '⚠️ Demo Mode';
+                    libraryStatus.style.color = '#ff9800';
+                }
+            })
+            .catch(() => {});
 
         hotkeyInput.addEventListener('input', function() {
             const key = this.value.trim() || 'space';
@@ -506,7 +538,10 @@ HTML_TEMPLATE = '''
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' }
             })
-            .then(response => response.json())
+            .then(response => {
+                if (!response.ok) throw new Error('HTTP ' + response.status);
+                return response.json();
+            })
             .then(data => {
                 if (data.success) {
                     const signal = data.signal;
@@ -612,7 +647,10 @@ HTML_TEMPLATE = '''
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(config)
             })
-            .then(response => response.json())
+            .then(response => {
+                if (!response.ok) throw new Error('HTTP ' + response.status);
+                return response.json();
+            })
             .then(data => {
                 if (data.success) {
                     isRunning = true;
@@ -658,7 +696,10 @@ HTML_TEMPLATE = '''
             if (updateInterval) clearInterval(updateInterval);
             updateInterval = setInterval(() => {
                 fetch('/get_signal')
-                .then(response => response.json())
+                .then(response => {
+                    if (!response.ok) throw new Error('HTTP ' + response.status);
+                    return response.json();
+                })
                 .then(data => {
                     if (data.price) {
                         lastPrice.textContent = typeof data.price === 'number' ? data.price.toFixed(5) : data.price;
@@ -730,6 +771,13 @@ HTML_TEMPLATE = '''
 def index():
     return render_template_string(HTML_TEMPLATE)
 
+@app.route('/status')
+def status():
+    return jsonify({
+        'has_library': HAS_TRADING_LIB,
+        'is_running': signal_data['is_running']
+    })
+
 @app.route('/start', methods=['POST'])
 def start_bot():
     global signal_thread, signal_data, bot_running
@@ -737,13 +785,10 @@ def start_bot():
     try:
         print("=== START REQUEST RECEIVED ===")
         
-        # Check if already running
         if signal_data['is_running']:
             return jsonify({'success': False, 'error': 'Bot already running'})
         
         config = request.json
-        print(f"Config: {config}")
-        
         if not config:
             return jsonify({'success': False, 'error': 'No configuration provided'})
         
@@ -755,7 +800,6 @@ def start_bot():
         if trade_exp < 3:
             trade_exp = 3
         
-        # Update signal data
         with update_lock:
             signal_data.update({
                 'ssid': ssid,
@@ -781,7 +825,6 @@ def start_bot():
                 'last_price_update': 0
             })
         
-        # Start the bot thread
         bot_running = True
         signal_thread = threading.Thread(target=run_signal_bot, daemon=True)
         signal_thread.start()
@@ -875,17 +918,24 @@ def run_signal_bot():
     global signal_data, trading_client, bot_running
     
     print("=== SIGNAL BOT THREAD STARTED ===")
+    print(f"HAS_TRADING_LIB: {HAS_TRADING_LIB}")
     
-    # Initialize trading client
+    # Initialize trading client with proper async handling
     if HAS_TRADING_LIB and signal_data.get('ssid'):
         try:
+            # Create a new event loop for this thread
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            
+            # Initialize the client
             trading_client = PocketOptionAsync(ssid=signal_data['ssid'])
-            print("PocketOption client initialized")
+            print("✅ PocketOption client initialized successfully")
         except Exception as e:
-            print(f"Failed to initialize client: {e}")
+            print(f"❌ Failed to initialize client: {e}")
+            traceback.print_exc()
             trading_client = None
     else:
-        print("Running in demo mode - using mock data")
+        print("⚠️ Running in demo mode - using mock data")
         trading_client = None
     
     # Initialize candle data
@@ -896,6 +946,8 @@ def run_signal_bot():
     current_candle_data = []
     first_run = True
     update_count = 0
+    
+    print("Starting main loop...")
     
     # Main loop
     while bot_running and signal_data['is_running']:
@@ -909,7 +961,7 @@ def run_signal_bot():
                 first_run = False
                 update_count += 1
                 
-                if update_count % 5 == 0:
+                if update_count % 10 == 0:
                     print(f"Update #{update_count}")
                 
                 # Get current price
@@ -924,7 +976,7 @@ def run_signal_bot():
                         candle_high_price = current_price
                         candle_low_price = current_price
                         candle_start_time = current_time
-                        print(f"Candle initialized at {current_price:.5f}")
+                        print(f"📊 Candle initialized at {current_price:.5f}")
                     
                     # Update high/low
                     if current_price > candle_high_price:
@@ -954,7 +1006,7 @@ def run_signal_bot():
                         })
                         if len(current_candle_data) > 50:
                             current_candle_data.pop(0)
-                        print(f"New candle at {current_price:.5f}")
+                        print(f"🕯️ New candle at {current_price:.5f}")
                     
                     # Generate signal
                     signal = generate_signal(
@@ -980,18 +1032,18 @@ def run_signal_bot():
                             signal_data['current_signal'] = signal
                             signal_data['last_update'] = datetime.now().strftime('%H:%M:%S.%f')[:-3]
                             signal_data['signal_count'] = signal_data.get('signal_count', 0) + 1
-                            print(f"Signal: {signal} at {current_price:.5f}")
+                            print(f"📈 Signal: {signal} at {current_price:.5f}")
                         elif not signal_data.get('current_signal') or signal_data.get('current_signal') == 'pending':
                             # Fallback signal
                             signal_data['current_signal'] = 'buy' if int(time.time()) % 2 == 0 else 'sell'
                             signal_data['last_update'] = datetime.now().strftime('%H:%M:%S.%f')[:-3]
                             signal_data['signal_count'] = signal_data.get('signal_count', 0) + 1
-                            print(f"Fallback signal: {signal_data['current_signal']}")
+                            print(f"🔄 Fallback signal: {signal_data['current_signal']}")
             
             time.sleep(0.1)
             
         except Exception as e:
-            print(f"Signal bot error: {e}")
+            print(f"❌ Signal bot error: {e}")
             traceback.print_exc()
             time.sleep(1)
     
@@ -1051,13 +1103,49 @@ def fetch_current_price():
     
     try:
         asset = signal_data.get('asset', 'EURUSD_otc')
-        price = asyncio.run(trading_client.get_current_price(asset))
-        if price:
-            return {'price': price, 'timestamp': time.time()}
+        
+        # Try to get price using the trading client
+        # Since PocketOptionAsync uses async methods, we need to handle it properly
+        try:
+            # Create a new event loop for this thread if needed
+            loop = asyncio.get_event_loop()
+            if loop.is_closed():
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+        except:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+        
+        # Try different methods to get price
+        if hasattr(trading_client, 'get_current_price'):
+            price = loop.run_until_complete(trading_client.get_current_price(asset))
+            if price:
+                return {'price': price, 'timestamp': time.time()}
+        
+        if hasattr(trading_client, 'get_candles'):
+            candles = loop.run_until_complete(trading_client.get_candles(asset, 1, 1))
+            if candles and len(candles) > 0:
+                latest = candles[-1]
+                return {
+                    'price': latest.get('close', 0),
+                    'timestamp': latest.get('time', time.time())
+                }
+        
+        if hasattr(trading_client, 'history'):
+            history = loop.run_until_complete(trading_client.history(asset, 1))
+            if history and len(history) > 0:
+                latest = history[-1]
+                return {
+                    'price': latest.get('close', 0),
+                    'timestamp': latest.get('time', time.time())
+                }
+        
+        # Fallback to mock data
+        return generate_mock_price()
+        
     except Exception as e:
-        pass
-    
-    return generate_mock_price()
+        print(f"⚠️ Price fetch failed, using mock: {e}")
+        return generate_mock_price()
 
 def generate_mock_price():
     """Generate realistic mock price data."""
