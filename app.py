@@ -11,6 +11,9 @@ from flask import Flask, render_template_string, request, jsonify, after_this_re
 from BinaryOptionsToolsV2.pocketoption import PocketOptionAsync
 import logging
 
+# At the top with other imports
+TEMPLATE_DIR = os.path.dirname(os.path.abspath(__file__))
+
 # Initialize Flask app
 app = Flask(__name__)
 
