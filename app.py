@@ -4,20 +4,30 @@ import time
 import threading
 import queue
 import os
-import random
-import numpy as np
-from datetime import datetime, timedelta
-from flask import Flask, render_template_string, request, jsonify, after_this_request
-from BinaryOptionsToolsV2.pocketoption import PocketOptionAsync
 import logging
+import gc
+from datetime import datetime
+from flask import Flask, render_template_string, request, jsonify
+from BinaryOptionsToolsV2.pocketoption import PocketOptionAsync
+import numpy as np
 
-# At the top with other imports
-TEMPLATE_DIR = os.path.dirname(os.path.abspath(__file__))
+# ==================== CONFIGURATION ====================
+# Disable Flask development logging
+logging.getLogger('werkzeug').setLevel(logging.ERROR)
+
+# Production settings
+DEBUG_MODE = os.environ.get('DEBUG', 'False').lower() == 'true'
+PORT = int(os.environ.get('PORT', 8080))
+HOST = os.environ.get('HOST', '0.0.0.0')
 
 # Initialize Flask app
 app = Flask(__name__)
+app.config['JSONIFY_PRETTYPRINT_REGULAR'] = False
+app.config['SEND_FILE_MAX_AGE_DEFAULT'] = 0
+app.debug = DEBUG_MODE
+app.env = 'production' if not DEBUG_MODE else 'development'
 
-# Add CORS headers after each request
+# ==================== CORS HEADERS ====================
 @app.after_request
 def after_request(response):
     response.headers.add('Access-Control-Allow-Origin', '*')
@@ -25,7 +35,7 @@ def after_request(response):
     response.headers.add('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE,OPTIONS')
     return response
 
-# Global variables
+# ==================== GLOBAL STATE ====================
 signal_data = {
     'asset': 'EURUSD_otc',
     'timeframe': 60,
@@ -47,28 +57,34 @@ signal_data = {
     'candle_low': None,
     'candle_open': None,
     'candle_start_time': None,
-    'manual_triggered': False
+    'manual_triggered': False,
+    'connection_status': 'disconnected',
+    'last_price_fetch': None,
+    'consecutive_failures': 0
 }
 
 trading_client = None
 signal_thread = None
 signal_queue = queue.Queue()
 update_lock = threading.Lock()
+event_loop = None
 
-# HTML template with fixed JavaScript - MANUAL MODE COMPLETELY FIXED
-HTML_TEMPLATE = '''
-<!DOCTYPE html>
+# ==================== LOGGING ====================
+logging.basicConfig(
+    level=logging.ERROR if not DEBUG_MODE else logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# ==================== HTML TEMPLATE ====================
+HTML_TEMPLATE = '''<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>PocketOption Signal Bot - 100% Real-time</title>
+    <title>PocketOption Signal Bot - Production</title>
     <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
             font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
@@ -85,17 +101,11 @@ HTML_TEMPLATE = '''
             padding: 30px;
             max-width: 900px;
             width: 100%;
+            max-height: 98vh;
+            overflow-y: auto;
         }
-        h1 {
-            color: #333;
-            margin-bottom: 10px;
-            text-align: center;
-        }
-        .subtitle {
-            text-align: center;
-            color: #666;
-            margin-bottom: 30px;
-        }
+        h1 { color: #333; margin-bottom: 10px; text-align: center; }
+        .subtitle { text-align: center; color: #666; margin-bottom: 30px; }
         .signal-display {
             background: #f8f9fa;
             border-radius: 15px;
@@ -105,32 +115,12 @@ HTML_TEMPLATE = '''
             border: 3px solid #e0e0e0;
             transition: all 0.3s ease;
         }
-        .signal-display.buy {
-            border-color: #28a745;
-            background: #d4edda;
-        }
-        .signal-display.sell {
-            border-color: #dc3545;
-            background: #f8d7da;
-        }
-        .signal-display.manual {
-            border-color: #ff9800;
-            background: #fff3e0;
-        }
-        .signal-text {
-            font-size: 48px;
-            font-weight: bold;
-            margin: 10px 0;
-        }
-        .signal-price {
-            font-size: 20px;
-            color: #555;
-        }
-        .signal-time {
-            font-size: 14px;
-            color: #888;
-            margin-top: 10px;
-        }
+        .signal-display.buy { border-color: #28a745; background: #d4edda; }
+        .signal-display.sell { border-color: #dc3545; background: #f8d7da; }
+        .signal-display.manual { border-color: #ff9800; background: #fff3e0; }
+        .signal-text { font-size: 48px; font-weight: bold; margin: 10px 0; }
+        .signal-price { font-size: 20px; color: #555; }
+        .signal-time { font-size: 14px; color: #888; margin-top: 10px; }
         .accuracy-badge {
             display: inline-block;
             background: #28a745;
@@ -183,18 +173,9 @@ HTML_TEMPLATE = '''
             border-radius: 8px;
             font-size: 14px;
         }
-        .setting-group input[type="checkbox"] {
-            width: auto;
-            margin-top: 5px;
-        }
-        .checkbox-group {
-            display: flex;
-            align-items: center;
-            gap: 10px;
-        }
-        .checkbox-group label {
-            margin-bottom: 0;
-        }
+        .setting-group input[type="checkbox"] { width: auto; margin-top: 5px; }
+        .checkbox-group { display: flex; align-items: center; gap: 10px; }
+        .checkbox-group label { margin-bottom: 0; }
         .button-group {
             display: flex;
             gap: 10px;
@@ -211,38 +192,16 @@ HTML_TEMPLATE = '''
             flex: 1;
             min-width: 120px;
         }
-        .btn-success {
-            background: #28a745;
-            color: white;
-        }
-        .btn-success:hover {
-            background: #218838;
-            transform: translateY(-2px);
-        }
-        .btn-danger {
-            background: #dc3545;
-            color: white;
-        }
-        .btn-danger:hover {
-            background: #c82333;
-            transform: translateY(-2px);
-        }
-        .btn-warning {
-            background: #ffc107;
-            color: #333;
-        }
-        .btn-warning:hover {
-            background: #e0a800;
-            transform: translateY(-2px);
-        }
-        .btn-secondary {
-            background: #6c757d;
-            color: white;
-        }
-        .btn-secondary:hover {
-            background: #5a6268;
-            transform: translateY(-2px);
-        }
+        .btn-success { background: #28a745; color: white; }
+        .btn-success:hover { background: #218838; transform: translateY(-2px); }
+        .btn-danger { background: #dc3545; color: white; }
+        .btn-danger:hover { background: #c82333; transform: translateY(-2px); }
+        .btn-warning { background: #ffc107; color: #333; }
+        .btn-warning:hover { background: #e0a800; transform: translateY(-2px); }
+        .btn-secondary { background: #6c757d; color: white; }
+        .btn-secondary:hover { background: #5a6268; transform: translateY(-2px); }
+        .btn-info { background: #17a2b8; color: white; }
+        .btn-info:hover { background: #138496; transform: translateY(-2px); }
         .status-bar {
             margin-top: 20px;
             padding: 15px;
@@ -256,9 +215,7 @@ HTML_TEMPLATE = '''
             padding: 5px 0;
             border-bottom: 1px solid #dee2e6;
         }
-        .status-item:last-child {
-            border-bottom: none;
-        }
+        .status-item:last-child { border-bottom: none; }
         .hotkey-indicator {
             display: inline-block;
             background: #333;
@@ -279,50 +236,15 @@ HTML_TEMPLATE = '''
             font-family: 'Courier New', monospace;
             font-size: 12px;
         }
-        .log-entry {
-            padding: 2px 0;
-            border-bottom: 1px solid #2d2d2d;
-        }
-        .log-entry.buy {
-            color: #4caf50;
-        }
-        .log-entry.sell {
-            color: #f44336;
-        }
-        .log-entry.error {
-            color: #ff6b6b;
-        }
-        .log-entry.precise {
-            color: #ffd700;
-        }
-        .log-entry.candle {
-            color: #00bcd4;
-        }
-        .log-entry.manual {
-            color: #ff9800;
-            font-weight: bold;
-        }
-        .log-entry.manual-buy {
-            color: #ff9800;
-            font-weight: bold;
-            background: rgba(255, 152, 0, 0.2);
-        }
-        .log-entry.manual-sell {
-            color: #ff9800;
-            font-weight: bold;
-            background: rgba(255, 152, 0, 0.2);
-        }
-        @media (max-width: 600px) {
-            .settings-grid {
-                grid-template-columns: 1fr;
-            }
-            .button-group {
-                flex-direction: column;
-            }
-            .btn {
-                width: 100%;
-            }
-        }
+        .log-entry { padding: 2px 0; border-bottom: 1px solid #2d2d2d; }
+        .log-entry.buy { color: #4caf50; }
+        .log-entry.sell { color: #f44336; }
+        .log-entry.error { color: #ff6b6b; }
+        .log-entry.precise { color: #ffd700; }
+        .log-entry.manual { color: #ff9800; font-weight: bold; }
+        .log-entry.manual-buy { color: #ff9800; font-weight: bold; background: rgba(255, 152, 0, 0.2); }
+        .log-entry.manual-sell { color: #ff9800; font-weight: bold; background: rgba(255, 152, 0, 0.2); }
+        .log-entry.connection { color: #00bcd4; }
         .ssid-input {
             margin-top: 15px;
             padding: 10px;
@@ -345,38 +267,38 @@ HTML_TEMPLATE = '''
             border-radius: 10px;
             border: 1px solid #b3d9ff;
         }
-        .expiration-input input {
-            width: 100%;
-            padding: 8px 12px;
-            border: 2px solid #ddd;
-            border-radius: 8px;
-            font-size: 14px;
-        }
         .candle-info {
             display: flex;
             justify-content: space-around;
             margin-top: 10px;
             font-size: 14px;
+            flex-wrap: wrap;
         }
-        .candle-info span {
-            font-weight: bold;
-        }
+        .candle-info span { font-weight: bold; margin: 2px 5px; }
         .candle-high { color: #28a745; }
         .candle-low { color: #dc3545; }
         .candle-open { color: #ffc107; }
+        .status-connected { color: #28a745; }
+        .status-disconnected { color: #dc3545; }
+        @media (max-width: 600px) {
+            .settings-grid { grid-template-columns: 1fr; }
+            .button-group { flex-direction: column; }
+            .btn { width: 100%; }
+            .candle-info { flex-direction: column; align-items: center; }
+        }
     </style>
 </head>
 <body>
     <div class="container">
         <h1>🚀 PocketOption Signal Bot</h1>
-        <p class="subtitle">100% Real-time Current Candle Analysis</p>
+        <p class="subtitle">Production-Ready Real-time Analysis</p>
 
         <div id="signalDisplay" class="signal-display">
             <div style="font-size: 14px; color: #888;">Current Signal</div>
             <div class="signal-text" id="signalText">WAITING</div>
             <div class="signal-price" id="signalPrice">Price: --</div>
             <div class="signal-time" id="signalTime">Last Update: --</div>
-            <div class="accuracy-badge" id="accuracyBadge">🎯 100% Real-time Mode</div>
+            <div class="accuracy-badge" id="accuracyBadge">🎯 Production Mode</div>
             
             <div class="candle-progress">
                 <div style="display: flex; justify-content: space-between;">
@@ -471,43 +393,24 @@ HTML_TEMPLATE = '''
             <button class="btn btn-success" id="startBtn">▶ Start Bot</button>
             <button class="btn btn-danger" id="stopBtn" disabled>⏹ Stop Bot</button>
             <button class="btn btn-warning" id="manualSignalBtn" disabled>⚡ Manual Signal</button>
+            <button class="btn btn-info" id="testBtn">🔌 Test Connection</button>
             <button class="btn btn-secondary" id="clearLogsBtn">🗑 Clear Logs</button>
         </div>
 
         <div class="status-bar">
-            <div class="status-item">
-                <span>Status:</span>
-                <span id="statusText">Stopped</span>
-            </div>
-            <div class="status-item">
-                <span>Hotkey:</span>
-                <span id="hotkeyDisplay"><span class="hotkey-indicator">space</span></span>
-            </div>
-            <div class="status-item">
-                <span>Mode:</span>
-                <span id="modeDisplay">Automatic</span>
-            </div>
-            <div class="status-item">
-                <span>Data Source:</span>
-                <span id="dataSourceDisplay">WebSocket</span>
-            </div>
-            <div class="status-item">
-                <span>SSID Status:</span>
-                <span id="ssidStatus">Not Set</span>
-            </div>
-            <div class="status-item">
-                <span>Signal Quality:</span>
-                <span id="signalQuality">100% Real-time</span>
-            </div>
-            <div class="status-item">
-                <span>Expiration Mode:</span>
-                <span id="expirationStatus">Disabled</span>
-            </div>
+            <div class="status-item"><span>Status:</span><span id="statusText">Stopped</span></div>
+            <div class="status-item"><span>Connection:</span><span id="connectionStatus" class="status-disconnected">Disconnected</span></div>
+            <div class="status-item"><span>Hotkey:</span><span id="hotkeyDisplay"><span class="hotkey-indicator">space</span></span></div>
+            <div class="status-item"><span>Mode:</span><span id="modeDisplay">Automatic</span></div>
+            <div class="status-item"><span>Data Source:</span><span id="dataSourceDisplay">WebSocket</span></div>
+            <div class="status-item"><span>SSID Status:</span><span id="ssidStatus">Not Set</span></div>
+            <div class="status-item"><span>Signal Quality:</span><span id="signalQuality">Production</span></div>
+            <div class="status-item"><span>Expiration Mode:</span><span id="expirationStatus">Disabled</span></div>
         </div>
 
         <div class="log-area" id="logArea">
             <div class="log-entry">[System] Bot initialized. Ready to start.</div>
-            <div class="log-entry precise">[System] 100% Real-time Current Candle Mode Active</div>
+            <div class="log-entry precise">[System] Production Mode Active - No Mock Data</div>
         </div>
     </div>
 
@@ -516,12 +419,12 @@ HTML_TEMPLATE = '''
         let updateInterval = null;
         let lastManualTriggerTime = 0;
 
-        // DOM elements
         const signalDisplay = document.getElementById('signalDisplay');
         const signalText = document.getElementById('signalText');
         const signalPrice = document.getElementById('signalPrice');
         const signalTime = document.getElementById('signalTime');
         const statusText = document.getElementById('statusText');
+        const connectionStatus = document.getElementById('connectionStatus');
         const modeDisplay = document.getElementById('modeDisplay');
         const dataSourceDisplay = document.getElementById('dataSourceDisplay');
         const hotkeyDisplay = document.getElementById('hotkeyDisplay');
@@ -542,6 +445,7 @@ HTML_TEMPLATE = '''
         const stopBtn = document.getElementById('stopBtn');
         const manualSignalBtn = document.getElementById('manualSignalBtn');
         const clearLogsBtn = document.getElementById('clearLogsBtn');
+        const testBtn = document.getElementById('testBtn');
 
         const ssidInput = document.getElementById('ssidInput');
         const assetSelect = document.getElementById('assetSelect');
@@ -553,13 +457,11 @@ HTML_TEMPLATE = '''
         const useExpiration = document.getElementById('useExpiration');
         const tradeExpiration = document.getElementById('tradeExpiration');
 
-        // Update hotkey display
         hotkeyInput.addEventListener('input', function() {
             const key = this.value.trim() || 'space';
             hotkeyDisplay.innerHTML = `<span class="hotkey-indicator">${key}</span>`;
         });
 
-        // Expiration checkbox handler
         useExpiration.addEventListener('change', function() {
             tradeExpiration.disabled = !this.checked;
             if (this.checked) {
@@ -582,7 +484,41 @@ HTML_TEMPLATE = '''
             }
         });
 
-        // Manual signal button
+        // Test connection button
+        testBtn.addEventListener('click', function() {
+            const ssid = ssidInput.value.trim();
+            if (!ssid) {
+                addLog('ERROR: Please enter your SSID first!', 'error');
+                return;
+            }
+            
+            addLog('🔌 Testing connection...', 'connection');
+            fetch('/test_connection', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ ssid: ssid })
+            })
+            .then(r => r.json())
+            .then(data => {
+                if (data.success) {
+                    connectionStatus.textContent = 'Connected ✓';
+                    connectionStatus.className = 'status-connected';
+                    ssidStatus.textContent = 'Valid ✓';
+                    ssidStatus.style.color = '#28a745';
+                    addLog('✅ Connection successful!', 'precise');
+                } else {
+                    connectionStatus.textContent = 'Failed ✗';
+                    connectionStatus.className = 'status-disconnected';
+                    ssidStatus.textContent = 'Invalid';
+                    ssidStatus.style.color = '#dc3545';
+                    addLog('❌ Connection failed: ' + data.error, 'error');
+                }
+            })
+            .catch(err => {
+                addLog('❌ Test error: ' + err.message, 'error');
+            });
+        });
+
         manualSignalBtn.addEventListener('click', function() {
             if (!isRunning) {
                 addLog('Bot is not running!', 'error');
@@ -609,20 +545,13 @@ HTML_TEMPLATE = '''
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' }
             })
-            .then(response => {
-                if (!response.ok) {
-                    throw new Error('HTTP error! status: ' + response.status);
-                }
-                return response.json();
-            })
+            .then(response => response.json())
             .then(data => {
-                console.log('Manual signal response:', data);
                 if (data.success) {
                     const signal = data.signal;
                     const price = data.price || '--';
                     const timestamp = new Date().toLocaleTimeString();
                     
-                    // Update display immediately
                     signalText.textContent = signal.toUpperCase();
                     signalPrice.textContent = `Price: ${price}`;
                     signalTime.textContent = `Last Update: ${timestamp}`;
@@ -637,12 +566,10 @@ HTML_TEMPLATE = '''
                 }
             })
             .catch(err => {
-                console.error('Manual signal error:', err);
                 addLog('❌ Error: ' + err.message, 'error');
             });
         }
 
-        // Start bot
         startBtn.addEventListener('click', function() {
             const ssid = ssidInput.value.trim();
             if (!ssid) {
@@ -678,7 +605,7 @@ HTML_TEMPLATE = '''
                     startPolling();
                     ssidStatus.textContent = 'Set ✓';
                     ssidStatus.style.color = '#28a745';
-                    signalQuality.textContent = '100% Real-time';
+                    signalQuality.textContent = 'Production';
                     signalQuality.style.color = '#28a745';
                     if (useExpiration.checked) {
                         expirationStatus.textContent = 'Enabled (' + tradeExpiration.value + 's)';
@@ -699,7 +626,6 @@ HTML_TEMPLATE = '''
             });
         });
 
-        // Stop bot
         stopBtn.addEventListener('click', function() {
             fetch('/stop', { method: 'POST' })
                 .then(r => r.json())
@@ -709,11 +635,12 @@ HTML_TEMPLATE = '''
                         updateUI(false);
                         stopPolling();
                         addLog('Bot stopped', 'info');
+                        connectionStatus.textContent = 'Disconnected';
+                        connectionStatus.className = 'status-disconnected';
                     }
                 });
         });
 
-        // Clear logs
         clearLogsBtn.addEventListener('click', function() {
             logArea.innerHTML = '';
             addLog('Logs cleared', 'info');
@@ -750,7 +677,7 @@ HTML_TEMPLATE = '''
                 signalText.textContent = 'WAITING';
                 signalPrice.textContent = 'Price: --';
                 signalTime.textContent = 'Last Update: --';
-                signalQuality.textContent = '100% Real-time';
+                signalQuality.textContent = 'Production';
                 signalQuality.style.color = '#28a745';
                 
                 candleProgressFill.style.width = '0%';
@@ -790,9 +717,12 @@ HTML_TEMPLATE = '''
                         if (data.candle_data) {
                             updateCandleDisplay(data.candle_data);
                         }
+                        if (data.connection_status) {
+                            updateConnectionStatus(data.connection_status);
+                        }
                     })
                     .catch(err => console.error('Polling error:', err));
-            }, 100);
+            }, 500);
         }
 
         function stopPolling() {
@@ -848,6 +778,16 @@ HTML_TEMPLATE = '''
             candleTimeRemaining.textContent = timeRemaining;
         }
 
+        function updateConnectionStatus(status) {
+            if (status === 'connected') {
+                connectionStatus.textContent = 'Connected ✓';
+                connectionStatus.className = 'status-connected';
+            } else {
+                connectionStatus.textContent = 'Disconnected ✗';
+                connectionStatus.className = 'status-disconnected';
+            }
+        }
+
         function addLog(message, type = 'info') {
             const entry = document.createElement('div');
             entry.className = `log-entry ${type}`;
@@ -857,14 +797,9 @@ HTML_TEMPLATE = '''
             logArea.scrollTop = logArea.scrollHeight;
         }
 
-        // Keyboard hotkey listener
         document.addEventListener('keydown', function(e) {
-            if (!isRunning) {
-                return;
-            }
-            if (!manualMode.checked) {
-                return;
-            }
+            if (!isRunning) return;
+            if (!manualMode.checked) return;
             const hotkey = hotkeyInput.value.trim() || 'space';
             const key = e.key.toLowerCase();
 
@@ -875,11 +810,10 @@ HTML_TEMPLATE = '''
             }
         });
 
-        // Initialize UI
         updateUI(false);
         addLog('System ready. Enter your SSID and click Start.', 'info');
+        addLog('🚀 Production Mode - No Mock Data', 'precise');
         addLog('Hotkey: space (change in settings)', 'info');
-        addLog('🎯 100% Real-time Current Candle Analysis Active', 'precise');
         addLog('Minimum trade expiration: 3 seconds', 'info');
         ssidStatus.textContent = 'Not Set';
         ssidStatus.style.color = '#dc3545';
@@ -888,14 +822,45 @@ HTML_TEMPLATE = '''
 </html>
 '''
 
-# Flask routes
+# ==================== ROUTES ====================
 @app.route('/')
 def index():
     return render_template_string(HTML_TEMPLATE)
 
+@app.route('/test_connection', methods=['POST'])
+def test_connection():
+    """Test PocketOption connection with SSID"""
+    try:
+        data = request.json
+        ssid = data.get('ssid', '').strip()
+        
+        if not ssid:
+            return jsonify({'success': False, 'error': 'SSID required'})
+        
+        # Quick test connection
+        test_client = PocketOptionAsync(ssid=ssid)
+        
+        # Try to fetch a price
+        try:
+            import asyncio
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            price = loop.run_until_complete(test_client.get_current_price('EURUSD_otc'))
+            loop.close()
+            
+            if price:
+                return jsonify({'success': True, 'price': price})
+            else:
+                return jsonify({'success': False, 'error': 'Could not fetch price'})
+        except Exception as e:
+            return jsonify({'success': False, 'error': str(e)})
+            
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)})
+
 @app.route('/start', methods=['POST'])
 def start_bot():
-    global signal_thread, signal_data, trading_client
+    global signal_thread, signal_data, trading_client, event_loop
     
     with update_lock:
         if signal_data['is_running']:
@@ -906,6 +871,9 @@ def start_bot():
         
         if not ssid:
             return jsonify({'success': False, 'error': 'SSID is required'})
+        
+        if len(ssid) < 10:
+            return jsonify({'success': False, 'error': 'Invalid SSID format'})
         
         trade_exp = int(config.get('trade_expiration', 60))
         if trade_exp < 3:
@@ -931,9 +899,21 @@ def start_bot():
             'candle_low': None,
             'candle_open': None,
             'candle_start_time': None,
-            'manual_triggered': False
+            'manual_triggered': False,
+            'consecutive_failures': 0
         })
         
+        # Initialize client
+        try:
+            trading_client = PocketOptionAsync(ssid=ssid)
+            signal_data['connection_status'] = 'connected'
+            logger.info("PocketOption client initialized successfully")
+        except Exception as e:
+            signal_data['is_running'] = False
+            signal_data['connection_status'] = 'disconnected'
+            return jsonify({'success': False, 'error': f'Failed to connect: {str(e)}'})
+        
+        # Clear queue
         while not signal_queue.empty():
             try:
                 signal_queue.get_nowait()
@@ -947,18 +927,17 @@ def start_bot():
 
 @app.route('/stop', methods=['POST'])
 def stop_bot():
-    global signal_data
+    global signal_data, trading_client
     
     with update_lock:
         signal_data['is_running'] = False
+        signal_data['connection_status'] = 'disconnected'
         
-        global trading_client
         if trading_client:
             try:
-                pass
+                trading_client = None
             except:
                 pass
-            trading_client = None
         
         return jsonify({'success': True})
 
@@ -966,7 +945,6 @@ def stop_bot():
 def manual_signal():
     global signal_data
     
-    # Handle OPTIONS request for CORS
     if request.method == 'OPTIONS':
         return jsonify({'success': True})
     
@@ -976,38 +954,38 @@ def manual_signal():
     if not signal_data['manual_mode']:
         return jsonify({'success': False, 'error': 'Manual mode not enabled'})
     
-    # Get current price
-    current_price = signal_data.get('price_data')
+    # Get REAL current price (NO MOCK!)
+    current_price = None
+    
+    # Try to get real price
+    price_data = fetch_current_price()
+    if price_data:
+        current_price = price_data.get('price')
+    
     if current_price is None:
-        price_data = fetch_current_price()
-        if price_data:
-            current_price = price_data.get('price')
+        return jsonify({'success': False, 'error': 'Could not fetch real price data'})
     
     # Get candle data
     open_price = signal_data.get('candle_open')
     if open_price is None:
-        open_price = current_price if current_price else 1.2000
+        open_price = current_price
     
-    # Generate manual signal immediately
-    if current_price and open_price:
-        if current_price > open_price:
-            signal = 'buy'
-        elif current_price < open_price:
-            signal = 'sell'
-        else:
-            signal = 'buy' if int(time.time()) % 2 == 0 else 'sell'
+    # Generate signal from REAL data
+    if current_price > open_price:
+        signal = 'buy'
+    elif current_price < open_price:
+        signal = 'sell'
     else:
-        signal = 'buy' if int(time.time()) % 2 == 0 else 'sell'
-        current_price = 1.2000
+        signal = 'buy' if current_price > open_price * 0.999 else 'sell'
     
-    # Update signal data with manual signal
+    # Update signal data
     with update_lock:
         signal_data['current_signal'] = signal
         signal_data['price_data'] = current_price
         signal_data['last_update'] = datetime.now().strftime('%H:%M:%S.%f')[:-3]
         signal_data['manual_triggered'] = True
     
-    logging.info(f"Manual signal generated: {signal} at {current_price}")
+    logger.info(f"Manual signal generated: {signal} at {current_price}")
     
     return jsonify({'success': True, 'signal': signal, 'price': current_price})
 
@@ -1026,6 +1004,7 @@ def get_signal():
             'manual_triggered': manual_triggered,
             'use_expiration': signal_data.get('use_expiration', False),
             'trade_expiration': signal_data.get('trade_expiration', 60),
+            'connection_status': signal_data.get('connection_status', 'disconnected'),
             'candle_data': {
                 'progress': signal_data.get('candle_progress', 0),
                 'open': signal_data.get('candle_open'),
@@ -1041,21 +1020,16 @@ def get_signal():
             
         return jsonify(response)
 
+# ==================== CORE BOT LOGIC ====================
 def run_signal_bot():
     global signal_data, trading_client, signal_queue
     
-    logging.info("Signal bot thread started")
+    logger.info("Signal bot thread started")
     
     ssid = signal_data.get('ssid')
     if not ssid:
-        logging.error("No SSID provided")
-        return
-    
-    try:
-        trading_client = PocketOptionAsync(ssid=ssid)
-        logging.info("PocketOption client initialized")
-    except Exception as e:
-        logging.error(f"Failed to initialize client: {e}")
+        logger.error("No SSID provided")
+        signal_data['is_running'] = False
         return
     
     last_signal_time = 0
@@ -1064,89 +1038,135 @@ def run_signal_bot():
     candle_high_price = None
     candle_low_price = None
     current_candle_data = []
+    consecutive_failures = 0
+    last_successful_fetch = time.time()
     
-    logging.info("Starting main signal loop")
+    logger.info("Starting main signal loop - Production Mode (No Mock Data)")
     
     while signal_data['is_running']:
         try:
             current_time = time.time()
             
-            should_update = False
+            # Only update at the specified rate
+            if current_time - last_signal_time < signal_data['update_rate']:
+                time.sleep(0.05)
+                continue
             
-            if not signal_data['manual_mode']:
-                if current_time - last_signal_time >= signal_data['update_rate']:
-                    should_update = True
+            # Get REAL price data (NO MOCK!)
+            price_data = fetch_current_price()
             
-            if should_update:
-                price_data = fetch_current_price()
+            if price_data is None:
+                consecutive_failures += 1
+                signal_data['consecutive_failures'] = consecutive_failures
+                signal_data['connection_status'] = 'disconnected'
                 
-                if price_data:
-                    current_price = price_data.get('price', 0)
-                    timestamp = price_data.get('timestamp', current_time)
-                    
-                    if candle_open_price is None:
-                        candle_open_price = current_price
-                        candle_high_price = current_price
-                        candle_low_price = current_price
-                        candle_start_time = timestamp
-                    
-                    if current_price > candle_high_price:
-                        candle_high_price = current_price
-                    if current_price < candle_low_price:
-                        candle_low_price = current_price
-                    
-                    timeframe = signal_data['timeframe']
-                    elapsed = current_time - candle_start_time
-                    progress = min((elapsed / timeframe) * 100, 100)
-                    
-                    if elapsed >= timeframe:
-                        candle_open_price = current_price
-                        candle_high_price = current_price
-                        candle_low_price = current_price
-                        candle_start_time = current_time
-                        progress = 0
-                        
-                        current_candle_data.append({
-                            'open': candle_open_price,
-                            'high': candle_high_price,
-                            'low': candle_low_price,
-                            'close': current_price,
-                            'time': candle_start_time
-                        })
-                        
-                        if len(current_candle_data) > 50:
-                            current_candle_data.pop(0)
-                    
-                    with update_lock:
-                        signal_data['candle_open'] = candle_open_price
-                        signal_data['candle_high'] = candle_high_price
-                        signal_data['candle_low'] = candle_low_price
-                        signal_data['candle_progress'] = progress
-                        signal_data['candle_time_remaining'] = f"{max(0, timeframe - elapsed):.1f}s"
-                    
-                    signal = generate_signal_from_candle(
-                        current_price,
-                        candle_open_price,
-                        candle_high_price,
-                        candle_low_price,
-                        progress,
-                        current_candle_data
-                    )
-                    
-                    with update_lock:
-                        signal_data['current_signal'] = signal.get('signal')
-                        signal_data['price_data'] = current_price
-                        signal_data['last_update'] = datetime.now().strftime('%H:%M:%S.%f')[:-3]
-                        
-                last_signal_time = current_time
+                if consecutive_failures > 10:
+                    logger.error("Too many consecutive failures, attempting to reconnect...")
+                    try:
+                        if trading_client:
+                            trading_client = PocketOptionAsync(ssid=signal_data.get('ssid'))
+                            signal_data['connection_status'] = 'connected'
+                            consecutive_failures = 0
+                            logger.info("Reconnected successfully")
+                    except Exception as e:
+                        logger.error(f"Reconnection failed: {e}")
+                
+                time.sleep(1)
+                continue
             
-            time.sleep(0.05)
+            # Reset failures on success
+            consecutive_failures = 0
+            signal_data['consecutive_failures'] = 0
+            signal_data['connection_status'] = 'connected'
+            last_successful_fetch = current_time
+            
+            current_price = price_data.get('price', 0)
+            timestamp = price_data.get('timestamp', current_time)
+            
+            # Initialize candle data if needed
+            if candle_open_price is None:
+                candle_open_price = current_price
+                candle_high_price = current_price
+                candle_low_price = current_price
+                candle_start_time = timestamp
+                logger.info(f"New candle started at {current_price}")
+            
+            # Update candle extremes
+            if current_price > candle_high_price:
+                candle_high_price = current_price
+            if current_price < candle_low_price:
+                candle_low_price = current_price
+            
+            # Calculate progress
+            timeframe = signal_data['timeframe']
+            elapsed = current_time - candle_start_time
+            progress = min((elapsed / timeframe) * 100, 100)
+            
+            # Check for candle completion
+            if elapsed >= timeframe:
+                # Save completed candle
+                current_candle_data.append({
+                    'open': candle_open_price,
+                    'high': candle_high_price,
+                    'low': candle_low_price,
+                    'close': current_price,
+                    'time': candle_start_time
+                })
+                
+                # Keep only last 50 candles
+                if len(current_candle_data) > 50:
+                    current_candle_data.pop(0)
+                
+                logger.info(f"Candle completed: Open={candle_open_price:.5f}, High={candle_high_price:.5f}, Low={candle_low_price:.5f}, Close={current_price:.5f}")
+                
+                # Reset for new candle
+                candle_open_price = current_price
+                candle_high_price = current_price
+                candle_low_price = current_price
+                candle_start_time = current_time
+                progress = 0
+            
+            # Update candle display data
+            with update_lock:
+                signal_data['candle_open'] = candle_open_price
+                signal_data['candle_high'] = candle_high_price
+                signal_data['candle_low'] = candle_low_price
+                signal_data['candle_progress'] = progress
+                signal_data['candle_time_remaining'] = f"{max(0, timeframe - elapsed):.1f}s"
+                signal_data['price_data'] = current_price
+                signal_data['last_price_fetch'] = datetime.now().isoformat()
+            
+            # Generate signal from REAL data
+            signal = generate_signal_from_candle(
+                current_price,
+                candle_open_price,
+                candle_high_price,
+                candle_low_price,
+                progress,
+                current_candle_data
+            )
+            
+            # Update signal
+            with update_lock:
+                signal_data['current_signal'] = signal.get('signal')
+                signal_data['price_data'] = current_price
+                signal_data['last_update'] = datetime.now().strftime('%H:%M:%S.%f')[:-3]
+            
+            # Log signal changes
+            if signal.get('signal') in ['buy', 'sell']:
+                logger.info(f"Signal: {signal.get('signal')} at {current_price:.5f}")
+            
+            last_signal_time = current_time
+            
+            # Force garbage collection periodically
+            if int(current_time) % 60 == 0:
+                gc.collect()
             
         except Exception as e:
-            logging.error(f"Signal bot error: {e}")
-            time.sleep(0.5)
+            logger.error(f"Signal bot error: {e}")
+            time.sleep(1)
     
-    logging.info("Signal bot thread stopped")
+    logger.info("Signal bot thread stopped")
 
 def generate_signal_from_candle(current_price, open_price, high_price, low_price, progress, candle_history):
     global signal_data
@@ -1156,6 +1176,7 @@ def generate_signal_from_candle(current_price, open_price, high_price, low_price
         trade_expiration = signal_data.get('trade_expiration', 60)
         timeframe = signal_data['timeframe']
         
+        # Check expiration
         if use_expiration:
             elapsed = (progress / 100) * timeframe
             remaining = timeframe - elapsed
@@ -1163,99 +1184,126 @@ def generate_signal_from_candle(current_price, open_price, high_price, low_price
             if remaining < trade_expiration:
                 return {'signal': 'hold', 'price': current_price}
         
+        # Early candle signal (first 10%)
         if progress < 10:
             if len(candle_history) >= 2:
                 prev_close = candle_history[-2].get('close', current_price)
-                if current_price > prev_close:
+                if current_price > prev_close * 1.0001:
                     return {'signal': 'buy', 'price': current_price}
-                elif current_price < prev_close:
+                elif current_price < prev_close * 0.9999:
                     return {'signal': 'sell', 'price': current_price}
         
+        # Strong breakout signals (0.2% move)
         if high_price > open_price * 1.002 and current_price > open_price:
             return {'signal': 'buy', 'price': current_price}
         elif low_price < open_price * 0.998 and current_price < open_price:
             return {'signal': 'sell', 'price': current_price}
         
+        # Previous candle breakout
         if len(candle_history) >= 3:
-            last_candle = candle_history[-1]
             prev_candle = candle_history[-2]
             
-            if last_candle and prev_candle:
+            if prev_candle:
+                # Bullish breakout
                 if (prev_candle.get('close', 0) < prev_candle.get('open', 0) and 
                     current_price > prev_candle.get('high', 0)):
                     return {'signal': 'buy', 'price': current_price}
                 
+                # Bearish breakout
                 if (prev_candle.get('close', 0) > prev_candle.get('open', 0) and 
                     current_price < prev_candle.get('low', 0)):
                     return {'signal': 'sell', 'price': current_price}
         
-        if current_price > open_price:
+        # Direction based on current vs open
+        if current_price > open_price * 1.0005:
             return {'signal': 'buy', 'price': current_price}
-        elif current_price < open_price:
+        elif current_price < open_price * 0.9995:
             return {'signal': 'sell', 'price': current_price}
-        else:
-            return {'signal': 'buy' if int(time.time()) % 2 == 0 else 'sell', 'price': current_price}
+        
+        # Neutral - hold
+        return {'signal': 'hold', 'price': current_price}
             
     except Exception as e:
-        logging.error(f"Signal generation error: {e}")
+        logger.error(f"Signal generation error: {e}")
         if current_price > open_price:
             return {'signal': 'buy', 'price': current_price}
         else:
             return {'signal': 'sell', 'price': current_price}
 
 def fetch_current_price():
+    """Fetch real price data ONLY - NO MOCK DATA"""
     global trading_client, signal_data
     
     if trading_client is None:
-        return generate_mock_price()
+        logger.error("Trading client not initialized")
+        return None
     
     try:
-        asset = signal_data['asset']
+        asset = signal_data.get('asset', 'EURUSD_otc')
         
+        # Try get_current_price first
         try:
             if hasattr(trading_client, 'get_current_price'):
                 price = asyncio.run(trading_client.get_current_price(asset))
-                if price:
-                    return {'price': price, 'timestamp': time.time()}
-        except:
-            pass
+                if price and float(price) > 0:
+                    return {'price': float(price), 'timestamp': time.time()}
+        except Exception as e:
+            logger.debug(f"get_current_price failed: {e}")
         
+        # Try get_candles
         try:
-            candles = asyncio.run(trading_client.get_candles(asset, 1, 1))
-            if candles and len(candles) > 0:
-                latest = candles[-1]
-                return {
-                    'price': latest.get('close', 0),
-                    'timestamp': latest.get('time', time.time())
-                }
-        except:
-            pass
+            if hasattr(trading_client, 'get_candles'):
+                candles = asyncio.run(trading_client.get_candles(asset, 1, 1))
+                if candles and len(candles) > 0:
+                    latest = candles[-1]
+                    close_price = float(latest.get('close', 0))
+                    if close_price > 0:
+                        return {
+                            'price': close_price,
+                            'timestamp': float(latest.get('time', time.time()))
+                        }
+        except Exception as e:
+            logger.debug(f"get_candles failed: {e}")
         
+        # Try history
         try:
-            history = asyncio.run(trading_client.history(asset, 1))
-            if history and len(history) > 0:
-                latest = history[-1]
-                return {
-                    'price': latest.get('close', 0),
-                    'timestamp': latest.get('time', time.time())
-                }
-        except:
-            pass
+            if hasattr(trading_client, 'history'):
+                history = asyncio.run(trading_client.history(asset, 1))
+                if history and len(history) > 0:
+                    latest = history[-1]
+                    close_price = float(latest.get('close', 0))
+                    if close_price > 0:
+                        return {
+                            'price': close_price,
+                            'timestamp': float(latest.get('time', time.time()))
+                        }
+        except Exception as e:
+            logger.debug(f"history failed: {e}")
         
-        return generate_mock_price()
+        # All methods failed
+        logger.error("All price fetch methods failed")
+        return None
         
     except Exception as e:
-        logging.error(f"Price fetch error: {e}")
-        return generate_mock_price()
+        logger.error(f"Price fetch error: {e}")
+        return None
 
-def generate_mock_price():
-    asset = signal_data.get('asset', 'EURUSD_otc')
-    base_price = 1.2000 if 'EURUSD' in asset else 1.0000
+# ==================== PRODUCTION SERVER ====================
+if __name__ == '__main__':
+    # Production settings
+    if not DEBUG_MODE:
+        print("\n" + "="*50)
+        print("🚀 PocketOption Signal Bot - PRODUCTION MODE")
+        print("="*50)
+        print(f"Server: http://{HOST}:{PORT}")
+        print("Status: Running in Production Mode")
+        print("Note: No mock data will be used")
+        print("="*50 + "\n")
     
-    movement = np.random.normal(0, 0.0002)
-    price = base_price + movement
-    
-    return {
-        'price': price,
-        'timestamp': time.time()
-    }
+    app.run(
+        host=HOST,
+        port=PORT,
+        debug=DEBUG_MODE,
+        threaded=True,
+        use_reloader=False  # Disable reloader for production
+    )
