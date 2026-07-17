@@ -1,6 +1,3 @@
-# render.py - Deployable PocketOption Signal Bot for Render.com
-# Complete working version with all fixes
-
 import asyncio
 import json
 import time
@@ -11,6 +8,7 @@ import random
 import numpy as np
 from datetime import datetime, timedelta
 from flask import Flask, render_template_string, request, jsonify, after_this_request
+from BinaryOptionsToolsV2.pocketoption import PocketOptionAsync
 import logging
 
 # Initialize Flask app
@@ -46,8 +44,7 @@ signal_data = {
     'candle_low': None,
     'candle_open': None,
     'candle_start_time': None,
-    'manual_triggered': False,
-    'candle_time_remaining': '--'
+    'manual_triggered': False
 }
 
 trading_client = None
@@ -931,8 +928,7 @@ def start_bot():
             'candle_low': None,
             'candle_open': None,
             'candle_start_time': None,
-            'manual_triggered': False,
-            'candle_time_remaining': '--'
+            'manual_triggered': False
         })
         
         while not signal_queue.empty():
@@ -1053,17 +1049,11 @@ def run_signal_bot():
         return
     
     try:
-        # Try to import PocketOptionAsync, fallback to mock if not available
-        try:
-            from BinaryOptionsToolsV2.pocketoption import PocketOptionAsync
-            trading_client = PocketOptionAsync(ssid=ssid)
-            logging.info("PocketOption client initialized")
-        except ImportError:
-            logging.warning("BinaryOptionsToolsV2 not installed, using mock client")
-            trading_client = None
+        trading_client = PocketOptionAsync(ssid=ssid)
+        logging.info("PocketOption client initialized")
     except Exception as e:
         logging.error(f"Failed to initialize client: {e}")
-        trading_client = None
+        return
     
     last_signal_time = 0
     candle_start_time = time.time()
@@ -1270,13 +1260,10 @@ def generate_mock_price():
 if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
     
-    # Get port from environment variable for Render.com
-    port = int(os.environ.get('PORT', 5000))
-    
     print("\n" + "="*50)
     print("🚀 PocketOption Signal Bot - 100% Real-time Current Candle")
     print("="*50)
-    print(f"1. Open your browser and go to: http://0.0.0.0:{port}")
+    print("1. Open your browser and go to: http://localhost:5000")
     print("2. Enter your PocketOption SSID in the field")
     print("3. Configure your settings")
     print("4. Click 'Start Bot' to begin")
@@ -1284,4 +1271,4 @@ if __name__ == '__main__':
     print("6. Manual Mode: Enable and use hotkey or button for manual signals")
     print("="*50 + "\n")
     
-    app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
+    app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
