@@ -5,6 +5,7 @@
 
 [functions]
   directory = "functions"
+  node_bundler = "esbuild"
 
 [build.environment]
   PYTHON_VERSION = "3.9"
@@ -12,4 +13,9 @@
 [[redirects]]
   from = "/api/*"
   to = "/.netlify/functions/index/:splat"
+  status = 200
+
+[[redirects]]
+  from = "/.netlify/functions/index"
+  to = "/.netlify/functions/index"
   status = 200
