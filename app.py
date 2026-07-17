@@ -984,45 +984,51 @@ def manual_signal():
     if request.method == 'OPTIONS':
         return jsonify({'success': True})
     
-    if not signal_data['is_running']:
-        return jsonify({'success': False, 'error': 'Bot not running'})
-    
-    if not signal_data['manual_mode']:
-        return jsonify({'success': False, 'error': 'Manual mode not enabled'})
-    
-    # Get current price
-    current_price = signal_data.get('price_data')
-    if current_price is None:
-        price_data = fetch_current_price()
-        if price_data:
-            current_price = price_data.get('price')
-    
-    # Get candle data    open_price = signal_data.get('candle_open')
-    if open_price is None:
-        open_price = current_price if current_price else 1.2000
-    
-    # Generate manual signal immediately
-    if current_price and open_price:
-        if current_price > open_price:
-            signal = 'buy'
-        elif current_price < open_price:
-            signal = 'sell'
+    try:
+        if not signal_data['is_running']:
+            return jsonify({'success': False, 'error': 'Bot not running'})
+        
+        if not signal_data['manual_mode']:
+            return jsonify({'success': False, 'error': 'Manual mode not enabled'})
+        
+        # Get current price
+        current_price = signal_data.get('price_data')
+        if current_price is None:
+            price_data = fetch_current_price()
+            if price_data:
+                current_price = price_data.get('price')
+        
+        # Get candle data
+        open_price = signal_data.get('candle_open')
+        if open_price is None:
+            open_price = current_price if current_price else 1.2000
+        
+        # Generate manual signal immediately
+        if current_price and open_price:
+            if current_price > open_price:
+                signal = 'buy'
+            elif current_price < open_price:
+                signal = 'sell'
+            else:
+                signal = 'buy' if int(time.time()) % 2 == 0 else 'sell'
         else:
             signal = 'buy' if int(time.time()) % 2 == 0 else 'sell'
-    else:
-        signal = 'buy' if int(time.time()) % 2 == 0 else 'sell'
-        current_price = 1.2000
-    
-    # Update signal data with manual signal
-    with update_lock:
-        signal_data['current_signal'] = signal
-        signal_data['price_data'] = current_price
-        signal_data['last_update'] = datetime.now().strftime('%H:%M:%S.%f')[:-3]
-        signal_data['manual_triggered'] = True
-    
-    logging.info(f"Manual signal generated: {signal} at {current_price}")
-    
-    return jsonify({'success': True, 'signal': signal, 'price': current_price})
+            current_price = 1.2000
+        
+        # Update signal data with manual signal
+        with update_lock:
+            signal_data['current_signal'] = signal
+            signal_data['price_data'] = current_price
+            signal_data['last_update'] = datetime.now().strftime('%H:%M:%S.%f')[:-3]
+            signal_data['manual_triggered'] = True
+        
+        logging.info(f"Manual signal generated: {signal} at {current_price}")
+        
+        return jsonify({'success': True, 'signal': signal, 'price': current_price})
+        
+    except Exception as e:
+        logging.error(f"Manual signal error: {e}")
+        return jsonify({'success': False, 'error': str(e)})
 
 @app.route('/get_signal')
 def get_signal():
