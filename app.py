@@ -6,6 +6,7 @@ import queue
 import os
 import logging
 import gc
+import re
 from datetime import datetime
 from flask import Flask, render_template_string, request, jsonify
 import numpy as np
@@ -67,48 +68,43 @@ signal_data = {
 trading_client = None
 signal_thread = None
 update_lock = threading.Lock()
-event_loop = None
 
 logging.basicConfig(level=logging.ERROR if not DEBUG_MODE else logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ==================== SSID EXTRACTION ====================
-def extract_ssid(raw_ssid):
-    """Extract SSID from various formats"""
-    if not raw_ssid:
+# ==================== SSID HELPERS ====================
+def extract_session_from_auth(auth_message):
+    """Extract session from WebSocket auth message"""
+    if not auth_message:
         return None
     
-    raw_ssid = raw_ssid.strip()
-    
-    # If it's the WebSocket message format
-    if raw_ssid.startswith('42["auth"'):
+    # Check if it's the WebSocket message format
+    if isinstance(auth_message, str) and auth_message.startswith('42["auth"'):
         try:
-            import json
-            import re
-            json_match = re.search(r'42(\[.*\])', raw_ssid)
+            # Extract the JSON part
+            json_match = re.search(r'42(\[.*\])', auth_message)
             if json_match:
                 data = json.loads(json_match.group(1))
                 if data and len(data) > 1 and isinstance(data[1], dict):
                     if 'session' in data[1]:
                         return data[1]['session']
-        except:
-            pass
-        
-        # Fallback: regex extraction
-        import re
-        match = re.search(r'"session":"([^"]+)"', raw_ssid)
-        if match:
-            return match.group(1)
+        except Exception as e:
+            logger.debug(f"Failed to parse auth message: {e}")
     
-    # If it's a cookie string
-    if 'ssid=' in raw_ssid:
-        import re
-        match = re.search(r'ssid=([^;]+)', raw_ssid)
-        if match:
-            return match.group(1)
+    # If it's just the session string
+    if isinstance(auth_message, str) and len(auth_message) > 10:
+        return auth_message
     
-    # Return as-is
-    return raw_ssid
+    return None
+
+def build_auth_message(ssid):
+    """Build the WebSocket auth message from SSID"""
+    # If it's already a full auth message, return as-is
+    if isinstance(ssid, str) and ssid.startswith('42["auth"'):
+        return ssid
+    
+    # If it's just the session, build the full message
+    return f'42["auth",{{"session":"{ssid}","isDemo":1,"uid":0,"platform":2,"isFastHistory":true,"isOptimized":true}}]'
 
 # ==================== HTML TEMPLATE ====================
 HTML_TEMPLATE = '''<!DOCTYPE html>
@@ -310,7 +306,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         .candle-info span { font-weight: bold; margin: 2px 5px; }
         .candle-high { color: #28a745; }
         .candle-low { color: #dc3545; }
-        .candle-open { color: #ffc107; }
+        .candle-open { color: #ffc127; }
         .status-connected { color: #28a745; }
         .status-disconnected { color: #dc3545; }
         .help-text {
@@ -370,7 +366,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             <label style="font-weight: 600; display: block; margin-bottom: 5px;">PocketOption SSID:</label>
             <input type="text" id="ssidInput" placeholder="Enter your SSID from cookies" value="">
             <small style="color: #856404; display: block; margin-top: 5px;">
-                💡 Get SSID: Open PocketOption → F12 → Application → Cookies → Copy 'ssid' value
+                💡 Enter just the session value (e.g., r7seffi1r662i33roiengjikcm)
             </small>
         </div>
 
@@ -379,7 +375,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             1. Log in to <a href="https://pocketoption.com" target="_blank">pocketoption.com</a><br>
             2. Press <code>F12</code> → <code>Application</code> tab → <code>Cookies</code><br>
             3. Find <code>ssid</code> and copy the value (long string)<br>
-            4. Paste it above and click <strong>Test</strong>
+            4. Paste just the session value (not the full WebSocket message)
         </div>
 
         <div class="settings-grid">
@@ -713,18 +709,24 @@ def test_connection():
         if not raw_ssid:
             return jsonify({'success': False, 'error': 'SSID required'})
         
-        # Extract SSID
-        ssid = extract_ssid(raw_ssid)
+        # Extract session if it's the full auth message
+        session = extract_session_from_auth(raw_ssid)
+        if session:
+            raw_ssid = session
         
-        if not ssid or len(ssid) < 10:
-            return jsonify({'success': False, 'error': f'Invalid SSID format. Got: {ssid[:20]}...'})
+        if len(raw_ssid) < 10:
+            return jsonify({'success': False, 'error': f'SSID too short: {len(raw_ssid)} chars'})
+        
+        # Build the full auth message
+        auth_message = build_auth_message(raw_ssid)
         
         # Test WebSocket connection
         import asyncio
         
         async def test_connection():
             try:
-                po = PocketOptionAsync(ssid=ssid)
+                # Use the full auth message
+                po = PocketOptionAsync(ssid=auth_message)
                 
                 # Try to get current price
                 try:
@@ -746,16 +748,6 @@ def test_connection():
                 except Exception as e:
                     logger.debug(f"compile_candles error: {e}")
                 
-                # Try history
-                try:
-                    history = await asyncio.wait_for(po.history('EURUSD_otc', 60), timeout=10)
-                    if history and len(history) > 0:
-                        return {'success': True, 'price': history[-1].get('close')}
-                except asyncio.TimeoutError:
-                    pass
-                except Exception as e:
-                    logger.debug(f"history error: {e}")
-                
                 return {'success': False, 'error': 'Could not fetch data'}
                 
             except Exception as e:
@@ -773,7 +765,7 @@ def test_connection():
 
 @app.route('/start', methods=['POST'])
 def start_bot():
-    global signal_thread, signal_data, trading_client, event_loop
+    global signal_thread, signal_data, trading_client
     
     with update_lock:
         if signal_data['is_running']:
@@ -785,14 +777,19 @@ def start_bot():
         if not raw_ssid:
             return jsonify({'success': False, 'error': 'SSID required'})
         
-        # Extract SSID
-        ssid = extract_ssid(raw_ssid)
+        # Extract session if it's the full auth message
+        session = extract_session_from_auth(raw_ssid)
+        if session:
+            raw_ssid = session
         
-        if not ssid or len(ssid) < 10:
-            return jsonify({'success': False, 'error': f'Invalid SSID format. Got: {ssid[:20]}...'})
+        if len(raw_ssid) < 10:
+            return jsonify({'success': False, 'error': f'SSID too short: {len(raw_ssid)} chars'})
+        
+        # Build the full auth message
+        auth_message = build_auth_message(raw_ssid)
         
         signal_data.update({
-            'ssid': ssid,
+            'ssid': auth_message,
             'asset': config.get('asset', 'EURUSD_otc'),
             'timeframe': int(config.get('timeframe', 60)),
             'update_rate': float(config.get('update_rate', 0.5)),
@@ -808,9 +805,9 @@ def start_bot():
             'connection_status': 'connected'
         })
         
-        # Initialize WebSocket client
+        # Initialize WebSocket client with auth message
         try:
-            trading_client = PocketOptionAsync(ssid=ssid)
+            trading_client = PocketOptionAsync(ssid=auth_message)
             logger.info("WebSocket client initialized")
             signal_data['connection_status'] = 'connected'
         except Exception as e:
@@ -1085,7 +1082,7 @@ if __name__ == '__main__':
     print("💡 To get your SSID:")
     print("1. Log in to pocketoption.com")
     print("2. Press F12 -> Application -> Cookies")
-    print("3. Copy the 'ssid' value")
+    print("3. Copy the 'ssid' value (just the session string)")
     print("="*50 + "\n")
     
     app.run(host=HOST, port=PORT, debug=DEBUG_MODE, threaded=True)
