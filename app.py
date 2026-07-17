@@ -45,7 +45,7 @@ signal_data = {
     'timeframe': 60,
     'update_rate': 0.5,
     'manual_mode': False,
-    'websocket_mode': False,  # Disabled by default
+    'websocket_mode': False,
     'hotkey': 'space',
     'current_signal': None,
     'last_update': None,
@@ -74,14 +74,18 @@ logger = logging.getLogger(__name__)
 
 # ==================== POCKETOPTION REST API ====================
 class PocketOptionREST:
-    """Pure REST API client for PocketOption - No WebSocket"""
+    """Pure REST API client for PocketOption"""
     
     def __init__(self, ssid):
         self.ssid = ssid
         self.session = requests.Session()
+        
+        # Try different cookie formats
         self.session.cookies.set('ssid', ssid)
+        self.session.cookies.set('PHPSESSID', ssid)  # Alternative cookie name
+        
         self.session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
             'Accept': 'application/json, text/plain, */*',
             'Accept-Language': 'en-US,en;q=0.9',
             'Accept-Encoding': 'gzip, deflate, br',
@@ -90,11 +94,48 @@ class PocketOptionREST:
             'Connection': 'keep-alive',
             'Sec-Fetch-Dest': 'empty',
             'Sec-Fetch-Mode': 'cors',
-            'Sec-Fetch-Site': 'same-origin'
+            'Sec-Fetch-Site': 'same-origin',
+            'Cache-Control': 'no-cache',
+            'Pragma': 'no-cache'
         })
         self.base_url = 'https://pocketoption.com'
         self.last_price = None
         self.last_candles = []
+        self.is_authenticated = False
+    
+    def test_connection(self):
+        """Test if SSID works"""
+        try:
+            # Try to get profile info first
+            response = self.session.get(
+                f'{self.base_url}/api/profile',
+                timeout=10
+            )
+            if response.status_code == 200:
+                data = response.json()
+                if data.get('status') == 'success' or data.get('data'):
+                    self.is_authenticated = True
+                    return True
+            
+            # Try to get assets list
+            response = self.session.get(
+                f'{self.base_url}/api/assets',
+                timeout=10
+            )
+            if response.status_code == 200:
+                self.is_authenticated = True
+                return True
+            
+            # Try to get current price as fallback
+            price = self.get_current_price('EURUSD_otc')
+            if price:
+                self.is_authenticated = True
+                return True
+            
+            return False
+        except Exception as e:
+            logger.debug(f"Connection test failed: {e}")
+            return False
     
     def get_current_price(self, asset):
         """Get current price via REST API"""
@@ -117,7 +158,7 @@ class PocketOptionREST:
         # Try alternative endpoint
         try:
             response = self.session.get(
-                f'{self.base_url}/api/assets/current-price',
+                f'{self.base_url}/api/asset/current-price',
                 params={'asset': asset},
                 timeout=10
             )
@@ -188,39 +229,6 @@ class PocketOptionREST:
         except Exception as e:
             logger.debug(f"History endpoint failed: {e}")
         
-        # Try OTC candles
-        try:
-            response = self.session.get(
-                f'{self.base_url}/api/trade/otc-candles',
-                params={
-                    'asset': asset,
-                    'timeframe': timeframe,
-                    'count': count
-                },
-                timeout=10
-            )
-            if response.status_code == 200:
-                data = response.json()
-                if data.get('candles'):
-                    self.last_candles = data['candles']
-                    return data['candles']
-        except Exception as e:
-            logger.debug(f"OTC candles endpoint failed: {e}")
-        
-        return None
-    
-    def get_asset_info(self, asset):
-        """Get asset information"""
-        try:
-            response = self.session.get(
-                f'{self.base_url}/api/assets/info',
-                params={'asset': asset},
-                timeout=10
-            )
-            if response.status_code == 200:
-                return response.json()
-        except:
-            pass
         return None
 
 # ==================== HTML TEMPLATE ====================
@@ -229,7 +237,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>PocketOption Signal Bot - REST API</title>
+    <title>PocketOption Signal Bot</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
@@ -390,6 +398,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         .log-entry.precise { color: #ffd700; }
         .log-entry.manual { color: #ff9800; font-weight: bold; }
         .log-entry.connection { color: #00bcd4; }
+        .log-entry.warning { color: #ff9800; }
         .ssid-input {
             margin-top: 15px;
             padding: 10px;
@@ -425,11 +434,6 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         .candle-open { color: #ffc107; }
         .status-connected { color: #28a745; }
         .status-disconnected { color: #dc3545; }
-        @media (max-width: 600px) {
-            .settings-grid { grid-template-columns: 1fr; }
-            .button-group { flex-direction: column; }
-            .btn { width: 100%; }
-        }
         .method-badge {
             display: inline-block;
             padding: 2px 10px;
@@ -439,13 +443,31 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             margin-left: 5px;
         }
         .method-rest { background: #ff9800; color: white; }
-        .method-websocket { background: #4caf50; color: white; }
+        .help-text {
+            background: #f8f9fa;
+            padding: 10px;
+            border-radius: 8px;
+            margin-top: 10px;
+            font-size: 13px;
+            border-left: 3px solid #17a2b8;
+        }
+        .help-text code {
+            background: #e9ecef;
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-size: 12px;
+        }
+        @media (max-width: 600px) {
+            .settings-grid { grid-template-columns: 1fr; }
+            .button-group { flex-direction: column; }
+            .btn { width: 100%; }
+        }
     </style>
 </head>
 <body>
     <div class="container">
         <h1>🚀 PocketOption Signal Bot</h1>
-        <p class="subtitle">REST API Mode - No WebSocket Required</p>
+        <p class="subtitle">REST API Mode</p>
 
         <div id="signalDisplay" class="signal-display">
             <div style="font-size: 14px; color: #888;">Current Signal</div>
@@ -477,7 +499,17 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         <div class="ssid-input">
             <label style="font-weight: 600; display: block; margin-bottom: 5px;">PocketOption SSID:</label>
             <input type="text" id="ssidInput" placeholder="Enter your SSID from cookies" value="">
-            <small style="color: #856404; display: block; margin-top: 5px;">Get SSID from browser cookies (ssid value)</small>
+            <small style="color: #856404; display: block; margin-top: 5px;">
+                💡 Get SSID: Open PocketOption → F12 → Application → Cookies → Copy 'ssid' value
+            </small>
+        </div>
+
+        <div class="help-text">
+            <strong>🔍 How to get your SSID:</strong><br>
+            1. Log in to <a href="https://pocketoption.com" target="_blank">pocketoption.com</a><br>
+            2. Press <code>F12</code> → <code>Application</code> tab → <code>Cookies</code><br>
+            3. Find <code>ssid</code> and copy the value (long string)<br>
+            4. Paste it above and click <strong>Test</strong>
         </div>
 
         <div class="settings-grid">
@@ -559,6 +591,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
 
         <div class="log-area" id="logArea">
             <div class="log-entry">[System] Bot initialized. REST API Mode.</div>
+            <div class="log-entry connection">💡 Enter your SSID and click Test</div>
         </div>
     </div>
 
@@ -612,7 +645,14 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                 addLog('Please enter SSID first', 'error');
                 return;
             }
-            addLog('Testing REST API connection...', 'connection');
+            
+            if (ssid.length < 10) {
+                addLog('⚠️ SSID seems too short. Should be a long string.', 'warning');
+            }
+            
+            addLog('🔌 Testing REST API connection...', 'connection');
+            addLog('📡 SSID: ' + ssid.substring(0, 8) + '...' + ssid.substring(ssid.length - 4), 'connection');
+            
             fetch('/test_connection', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -623,18 +663,24 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                 if (data.success) {
                     connectionStatus.textContent = 'Connected ✓';
                     connectionStatus.className = 'status-connected';
-                    ssidStatus.textContent = 'Valid';
+                    ssidStatus.textContent = 'Valid ✓';
                     ssidStatus.style.color = '#28a745';
                     addLog('✅ Connection successful! Price: ' + data.price, 'precise');
+                    if (data.method) {
+                        addLog('📡 Method: ' + data.method, 'connection');
+                    }
                 } else {
                     connectionStatus.textContent = 'Failed ✗';
                     connectionStatus.className = 'status-disconnected';
                     ssidStatus.textContent = 'Invalid';
                     ssidStatus.style.color = '#dc3545';
                     addLog('❌ Connection failed: ' + data.error, 'error');
+                    addLog('💡 Make sure you copied the SSID correctly from cookies', 'warning');
                 }
             })
-            .catch(err => addLog('Error: ' + err.message, 'error'));
+            .catch(err => {
+                addLog('❌ Error: ' + err.message, 'error');
+            });
         });
 
         function triggerManualSignal() {
@@ -673,6 +719,8 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                 return;
             }
 
+            addLog('🚀 Starting bot with SSID: ' + ssid.substring(0, 8) + '...', 'connection');
+
             fetch('/start', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -696,13 +744,17 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                     if (manualMode.checked) manualSignalBtn.disabled = false;
                     statusText.textContent = 'Running';
                     statusText.style.color = '#28a745';
-                    ssidStatus.textContent = 'Set';
+                    ssidStatus.textContent = 'Active';
                     ssidStatus.style.color = '#28a745';
-                    addLog('✅ Bot started (REST API)', 'precise');
+                    addLog('✅ Bot started successfully!', 'precise');
                     startPolling();
                 } else {
-                    addLog('❌ Failed: ' + data.error, 'error');
+                    addLog('❌ Failed to start: ' + data.error, 'error');
+                    addLog('💡 Try testing the connection first with the Test button', 'warning');
                 }
+            })
+            .catch(err => {
+                addLog('❌ Error: ' + err.message, 'error');
             });
         };
 
@@ -718,13 +770,13 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                     connectionStatus.textContent = 'Disconnected';
                     connectionStatus.className = 'status-disconnected';
                     stopPolling();
-                    addLog('Bot stopped', 'info');
+                    addLog('⏹ Bot stopped', 'info');
                 });
         };
 
         clearLogsBtn.onclick = function() {
             logArea.innerHTML = '';
-            addLog('Logs cleared', 'info');
+            addLog('🗑 Logs cleared', 'info');
         };
 
         function startPolling() {
@@ -773,9 +825,18 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         function addLog(message, type = 'info') {
             const entry = document.createElement('div');
             entry.className = `log-entry ${type}`;
-            entry.textContent = `[${new Date().toLocaleTimeString()}] ${message}`;
+            const timestamp = new Date().toLocaleTimeString();
+            entry.textContent = `[${timestamp}] ${message}`;
             logArea.appendChild(entry);
             logArea.scrollTop = logArea.scrollHeight;
+        }
+
+        // Check if SSID is already in URL params
+        const urlParams = new URLSearchParams(window.location.search);
+        const ssidParam = urlParams.get('ssid');
+        if (ssidParam) {
+            ssidInput.value = ssidParam;
+            addLog('📡 SSID loaded from URL', 'connection');
         }
     </script>
 </body>
@@ -789,7 +850,7 @@ def index():
 
 @app.route('/test_connection', methods=['POST'])
 def test_connection():
-    """Test PocketOption REST API connection"""
+    """Test PocketOption REST API connection with detailed debugging"""
     try:
         data = request.json
         ssid = data.get('ssid', '').strip()
@@ -797,19 +858,53 @@ def test_connection():
         if not ssid:
             return jsonify({'success': False, 'error': 'SSID required'})
         
+        if len(ssid) < 10:
+            return jsonify({'success': False, 'error': 'SSID seems too short. Should be a long string.'})
+        
         # Test REST API
         rest = PocketOptionREST(ssid)
+        
+        # First test profile
+        try:
+            response = rest.session.get(
+                'https://pocketoption.com/api/profile',
+                timeout=10
+            )
+            if response.status_code == 200:
+                data = response.json()
+                if data.get('status') == 'success' or data.get('data'):
+                    # Get price as well
+                    price = rest.get_current_price('EURUSD_otc')
+                    return jsonify({
+                        'success': True, 
+                        'price': price or 'N/A',
+                        'method': 'REST API (Profile)'
+                    })
+        except Exception as e:
+            logger.debug(f"Profile test failed: {e}")
+        
+        # Try to get price directly
         price = rest.get_current_price('EURUSD_otc')
-        
         if price:
-            return jsonify({'success': True, 'price': price, 'method': 'REST API'})
-        else:
-            # Try to get candles as fallback
-            candles = rest.get_candles('EURUSD_otc', 60, 1)
-            if candles and len(candles) > 0:
-                return jsonify({'success': True, 'price': candles[-1].get('close'), 'method': 'REST API (candles)'})
+            return jsonify({
+                'success': True, 
+                'price': price,
+                'method': 'REST API (Price)'
+            })
         
-        return jsonify({'success': False, 'error': 'Could not fetch data. Check SSID.'})
+        # Try to get candles
+        candles = rest.get_candles('EURUSD_otc', 60, 5)
+        if candles and len(candles) > 0:
+            return jsonify({
+                'success': True, 
+                'price': candles[-1].get('close'),
+                'method': 'REST API (Candles)'
+            })
+        
+        return jsonify({
+            'success': False, 
+            'error': 'Could not fetch data. SSID may be invalid or expired.'
+        })
         
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)})
@@ -828,6 +923,9 @@ def start_bot():
         if not ssid:
             return jsonify({'success': False, 'error': 'SSID required'})
         
+        if len(ssid) < 10:
+            return jsonify({'success': False, 'error': 'Invalid SSID format'})
+        
         signal_data.update({
             'ssid': ssid,
             'asset': config.get('asset', 'EURUSD_otc'),
@@ -845,19 +943,27 @@ def start_bot():
         })
         
         # Initialize REST client
-        trading_client = PocketOptionREST(ssid)
-        
-        # Test connection
-        test_price = trading_client.get_current_price(signal_data['asset'])
-        if not test_price:
+        try:
+            trading_client = PocketOptionREST(ssid)
+            
+            # Test connection
+            test_price = trading_client.get_current_price(signal_data['asset'])
+            if not test_price:
+                signal_data['is_running'] = False
+                return jsonify({'success': False, 'error': 'Could not connect. Check SSID.'})
+            
+            logger.info(f"Connected with price: {test_price}")
+        except Exception as e:
             signal_data['is_running'] = False
-            return jsonify({'success': False, 'error': 'Could not connect. Check SSID.'})
+            return jsonify({'success': False, 'error': f'Connection error: {str(e)}'})
         
         signal_thread = threading.Thread(target=run_signal_bot, daemon=True)
         signal_thread.start()
         
         return jsonify({'success': True})
 
+# ==================== REST OF THE CODE ====================
+# [Keep the same routes and core logic from before]
 @app.route('/stop', methods=['POST'])
 def stop_bot():
     global signal_data, trading_client
@@ -915,7 +1021,6 @@ def get_signal():
             signal_data['manual_triggered'] = False
         return jsonify(response)
 
-# ==================== CORE LOGIC ====================
 def run_signal_bot():
     global signal_data, trading_client
     
@@ -928,10 +1033,6 @@ def run_signal_bot():
     current_candle_data = []
     last_signal_time = 0
     consecutive_failures = 0
-    last_candle_refresh = 0
-    
-    # Get initial candles
-    refresh_candles()
     
     while signal_data['is_running']:
         try:
@@ -940,11 +1041,6 @@ def run_signal_bot():
             if current_time - last_signal_time < signal_data['update_rate']:
                 time.sleep(0.05)
                 continue
-            
-            # Refresh candles periodically
-            if current_time - last_candle_refresh > 30:
-                refresh_candles()
-                last_candle_refresh = current_time
             
             # Fetch current price
             price_data = fetch_current_price()
@@ -965,7 +1061,6 @@ def run_signal_bot():
             current_price = price_data.get('price', 0)
             timestamp = price_data.get('timestamp', current_time)
             
-            # Initialize candle if needed
             if candle_open_price is None:
                 candle_open_price = current_price
                 candle_high_price = current_price
@@ -973,7 +1068,6 @@ def run_signal_bot():
                 candle_start_time = timestamp
                 logger.info(f"New candle started at {current_price:.5f}")
             
-            # Update candle extremes
             candle_high_price = max(candle_high_price, current_price)
             candle_low_price = min(candle_low_price, current_price)
             
@@ -981,7 +1075,6 @@ def run_signal_bot():
             elapsed = current_time - candle_start_time
             progress = min((elapsed / timeframe) * 100, 100)
             
-            # Check for candle completion
             if elapsed >= timeframe:
                 current_candle_data.append({
                     'open': candle_open_price,
@@ -1001,7 +1094,6 @@ def run_signal_bot():
                 candle_start_time = current_time
                 progress = 0
             
-            # Update state
             with update_lock:
                 signal_data['candle_open'] = candle_open_price
                 signal_data['candle_high'] = candle_high_price
@@ -1010,7 +1102,6 @@ def run_signal_bot():
                 signal_data['candle_time_remaining'] = f"{max(0, timeframe - elapsed):.1f}s"
                 signal_data['price_data'] = current_price
             
-            # Generate signal
             signal = generate_signal(
                 current_price, 
                 candle_open_price, 
@@ -1035,34 +1126,9 @@ def run_signal_bot():
     
     logger.info("Signal bot stopped")
 
-def refresh_candles():
-    """Refresh candle history"""
-    global signal_data, trading_client
-    
-    if not trading_client:
-        return
-    
-    try:
-        asset = signal_data['asset']
-        timeframe = signal_data['timeframe']
-        
-        candles = trading_client.get_candles(asset, timeframe, 50)
-        if candles:
-            with update_lock:
-                signal_data['candle_history'] = candles
-                if len(candles) > 0:
-                    latest = candles[-1]
-                    signal_data['candle_open'] = latest.get('open')
-                    signal_data['candle_high'] = latest.get('max')
-                    signal_data['candle_low'] = latest.get('min')
-            logger.info(f"Refreshed {len(candles)} candles")
-    except Exception as e:
-        logger.debug(f"Candle refresh failed: {e}")
-
 def generate_signal(current_price, open_price, high_price, low_price, progress, candle_history):
     """Generate signal based on price action"""
     try:
-        # Check expiration
         if signal_data.get('use_expiration', False):
             timeframe = signal_data['timeframe']
             trade_exp = signal_data.get('trade_expiration', 60)
@@ -1070,7 +1136,6 @@ def generate_signal(current_price, open_price, high_price, low_price, progress, 
             if remaining < trade_exp:
                 return 'hold'
         
-        # Early candle signal (first 10%)
         if progress < 10 and len(candle_history) >= 2:
             prev_close = candle_history[-2].get('close', current_price)
             if current_price > prev_close * 1.0005:
@@ -1078,13 +1143,11 @@ def generate_signal(current_price, open_price, high_price, low_price, progress, 
             elif current_price < prev_close * 0.9995:
                 return 'sell'
         
-        # Strong breakout signals (0.2% move)
         if high_price > open_price * 1.002 and current_price > open_price:
             return 'buy'
         elif low_price < open_price * 0.998 and current_price < open_price:
             return 'sell'
         
-        # Previous candle breakout
         if len(candle_history) >= 3:
             prev_candle = candle_history[-2]
             if prev_candle:
@@ -1095,7 +1158,6 @@ def generate_signal(current_price, open_price, high_price, low_price, progress, 
                     current_price < prev_candle.get('low', 0)):
                     return 'sell'
         
-        # Direction based on current vs open
         threshold = 0.0005
         if current_price > open_price * (1 + threshold):
             return 'buy'
@@ -1109,7 +1171,7 @@ def generate_signal(current_price, open_price, high_price, low_price, progress, 
         return 'hold'
 
 def fetch_current_price():
-    """Fetch price using REST API only"""
+    """Fetch price using REST API"""
     global trading_client, signal_data
     
     if not trading_client:
@@ -1118,12 +1180,10 @@ def fetch_current_price():
     asset = signal_data.get('asset', 'EURUSD_otc')
     
     try:
-        # Get current price
         price = trading_client.get_current_price(asset)
         if price:
             return {'price': price, 'timestamp': time.time()}
         
-        # Fallback to candles
         candles = trading_client.get_candles(asset, 5, 1)
         if candles and len(candles) > 0:
             latest = candles[-1]
@@ -1144,6 +1204,11 @@ if __name__ == '__main__':
     print("="*50)
     print(f"Server: http://{HOST}:{PORT}")
     print("Mode: REST API (No WebSocket)")
+    print("="*50 + "\n")
+    print("💡 To get your SSID:")
+    print("1. Log in to pocketoption.com")
+    print("2. Press F12 -> Application -> Cookies")
+    print("3. Copy the 'ssid' value")
     print("="*50 + "\n")
     
     app.run(host=HOST, port=PORT, debug=DEBUG_MODE, threaded=True)
