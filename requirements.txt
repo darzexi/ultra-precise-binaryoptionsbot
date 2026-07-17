@@ -4,3 +4,4 @@ websocket-client==1.6.3
 python-dotenv==1.0.0
 gunicorn==21.2.0
 BinaryOptionsToolsV2
+requests
