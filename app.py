@@ -16,18 +16,23 @@ import numpy as np
 try:
     from BinaryOptionsToolsV2.pocketoption import PocketOptionAsync
     HAS_TRADING_LIB = True
-    print("✅ BinaryOptionsToolsV2 loaded successfully")
 except ImportError as e:
     HAS_TRADING_LIB = False
-    print(f"⚠️ BinaryOptionsToolsV2 not installed: {e}")
 except Exception as e:
     HAS_TRADING_LIB = False
-    print(f"⚠️ Error loading BinaryOptionsToolsV2: {e}")
 
 # Initialize Flask app
 app = Flask(__name__)
 app.secret_key = os.environ.get('SECRET_KEY', 'dev-secret-key-change-in-production')
 app.debug = False
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    stream=sys.stdout
+)
+logger = logging.getLogger(__name__)
 
 # Global variables
 signal_data = {
@@ -53,8 +58,7 @@ signal_data = {
     'manual_triggered': False,
     'candle_time_remaining': '--',
     'signal_count': 0,
-    'last_price_update': 0,
-    'price_history': []
+    'last_price_update': 0
 }
 
 trading_client = None
@@ -63,14 +67,13 @@ update_lock = threading.Lock()
 bot_running = False
 loop = None
 
-# Logging setup
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    stream=sys.stdout
-)
+# Log library status
+if HAS_TRADING_LIB:
+    logger.info("✅ BinaryOptionsToolsV2 loaded successfully")
+else:
+    logger.warning("⚠️ BinaryOptionsToolsV2 not available - running in demo mode")
 
-# HTML Template
+# ==================== HTML TEMPLATE ====================
 HTML_TEMPLATE = '''
 <!DOCTYPE html>
 <html lang="en">
@@ -761,7 +764,8 @@ def index():
 def status():
     return jsonify({
         'has_library': HAS_TRADING_LIB,
-        'is_running': signal_data['is_running']
+        'is_running': signal_data['is_running'],
+        'thread_alive': signal_thread is not None and signal_thread.is_alive() if signal_thread else False
     })
 
 @app.route('/start', methods=['POST'])
@@ -769,7 +773,7 @@ def start_bot():
     global signal_thread, signal_data, bot_running, loop
     
     try:
-        print("=== START REQUEST RECEIVED ===")
+        logger.info("=== START REQUEST RECEIVED ===")
         
         if signal_data['is_running']:
             return jsonify({'success': False, 'error': 'Bot already running'})
@@ -812,34 +816,41 @@ def start_bot():
                 'manual_triggered': False,
                 'candle_time_remaining': '--',
                 'signal_count': 0,
-                'last_price_update': 0,
-                'price_history': []
+                'last_price_update': 0
             })
         
         bot_running = True
+        
+        # Start the thread
         signal_thread = threading.Thread(target=run_signal_bot, daemon=True)
         signal_thread.start()
+        logger.info(f"Thread started, alive: {signal_thread.is_alive()}")
         
-        print("=== START SUCCESS ===")
+        logger.info("=== START SUCCESS ===")
         return jsonify({'success': True})
         
     except Exception as e:
-        print(f"=== START ERROR: {e} ===")
+        logger.error(f"=== START ERROR: {e} ===")
         traceback.print_exc()
         return jsonify({'success': False, 'error': str(e)})
 
 @app.route('/stop', methods=['POST'])
 def stop_bot():
-    global signal_data, trading_client, bot_running, loop
+    global signal_data, trading_client, bot_running, loop, signal_thread
     
     try:
-        print("=== STOP REQUEST RECEIVED ===")
+        logger.info("=== STOP REQUEST RECEIVED ===")
         
         with update_lock:
             bot_running = False
             signal_data['is_running'] = False
             signal_data['current_signal'] = None
             trading_client = None
+        
+        # Wait for thread to finish
+        if signal_thread and signal_thread.is_alive():
+            logger.info("Waiting for thread to finish...")
+            signal_thread.join(timeout=2.0)
         
         if loop:
             try:
@@ -848,11 +859,13 @@ def stop_bot():
                 pass
             loop = None
         
-        print("=== STOP SUCCESS ===")
+        signal_thread = None
+        
+        logger.info("=== STOP SUCCESS ===")
         return jsonify({'success': True})
         
     except Exception as e:
-        print(f"=== STOP ERROR: {e} ===")
+        logger.error(f"=== STOP ERROR: {e} ===")
         return jsonify({'success': False, 'error': str(e)})
 
 @app.route('/manual_signal', methods=['POST', 'OPTIONS'])
@@ -915,8 +928,9 @@ def get_signal():
 def run_signal_bot():
     global signal_data, trading_client, bot_running, loop
     
-    print("=== SIGNAL BOT THREAD STARTED ===")
-    print(f"HAS_TRADING_LIB: {HAS_TRADING_LIB}")
+    logger.info("=== SIGNAL BOT THREAD STARTED ===")
+    logger.info(f"HAS_TRADING_LIB: {HAS_TRADING_LIB}")
+    logger.info(f"SSID: {signal_data.get('ssid', 'None')[:20]}...")
     
     # Initialize trading client with proper async handling
     if HAS_TRADING_LIB and signal_data.get('ssid'):
@@ -927,13 +941,13 @@ def run_signal_bot():
             
             # Initialize the client
             trading_client = PocketOptionAsync(ssid=signal_data['ssid'])
-            print("✅ PocketOption client initialized successfully")
+            logger.info("✅ PocketOption client initialized successfully")
         except Exception as e:
-            print(f"❌ Failed to initialize client: {e}")
+            logger.error(f"❌ Failed to initialize client: {e}")
             traceback.print_exc()
             trading_client = None
     else:
-        print("⚠️ Running in demo mode - using mock data")
+        logger.warning("⚠️ Running in demo mode - using mock data")
         trading_client = None
     
     # Initialize candle data
@@ -945,7 +959,7 @@ def run_signal_bot():
     first_run = True
     update_count = 0
     
-    print("Starting main loop...")
+    logger.info("Starting main loop...")
     
     # Main loop
     while bot_running and signal_data['is_running']:
@@ -959,15 +973,17 @@ def run_signal_bot():
                 first_run = False
                 update_count += 1
                 
-                if update_count % 5 == 0:
-                    print(f"Update #{update_count}")
+                if update_count % 3 == 0:
+                    logger.info(f"Update #{update_count}")
                 
                 # Get current price
                 price_data = fetch_current_price()
                 
                 if price_data:
                     current_price = price_data.get('price', 0)
-                    print(f"Price fetched: {current_price:.5f}")
+                    
+                    if update_count % 3 == 0:
+                        logger.info(f"Price: {current_price:.5f}")
                     
                     # Initialize candle
                     if candle_open_price is None:
@@ -975,7 +991,7 @@ def run_signal_bot():
                         candle_high_price = current_price
                         candle_low_price = current_price
                         candle_start_time = current_time
-                        print(f"📊 Candle initialized at {current_price:.5f}")
+                        logger.info(f"📊 Candle initialized at {current_price:.5f}")
                     
                     # Update high/low
                     if current_price > candle_high_price:
@@ -1005,7 +1021,7 @@ def run_signal_bot():
                         })
                         if len(current_candle_data) > 50:
                             current_candle_data.pop(0)
-                        print(f"🕯️ New candle at {current_price:.5f}")
+                        logger.info(f"🕯️ New candle at {current_price:.5f}")
                     
                     # Generate signal
                     signal = generate_signal(
@@ -1031,22 +1047,23 @@ def run_signal_bot():
                             signal_data['current_signal'] = signal
                             signal_data['last_update'] = datetime.now().strftime('%H:%M:%S.%f')[:-3]
                             signal_data['signal_count'] = signal_data.get('signal_count', 0) + 1
-                            print(f"📈 Signal: {signal} at {current_price:.5f}")
+                            logger.info(f"📈 Signal: {signal} at {current_price:.5f}")
                         elif not signal_data.get('current_signal') or signal_data.get('current_signal') == 'pending':
                             # Fallback signal
                             signal_data['current_signal'] = 'buy' if int(time.time()) % 2 == 0 else 'sell'
                             signal_data['last_update'] = datetime.now().strftime('%H:%M:%S.%f')[:-3]
                             signal_data['signal_count'] = signal_data.get('signal_count', 0) + 1
-                            print(f"🔄 Fallback signal: {signal_data['current_signal']}")
+                            logger.info(f"🔄 Fallback signal: {signal_data['current_signal']}")
             
-            time.sleep(0.2)
+            # Small sleep to prevent CPU spinning
+            time.sleep(0.1)
             
         except Exception as e:
-            print(f"❌ Signal bot error: {e}")
+            logger.error(f"❌ Signal bot error: {e}")
             traceback.print_exc()
             time.sleep(1)
     
-    print("=== SIGNAL BOT THREAD STOPPED ===")
+    logger.info("=== SIGNAL BOT THREAD STOPPED ===")
 
 def generate_signal(current_price, open_price, high_price, low_price, progress, candle_history):
     """Generate a trading signal based on candle data."""
@@ -1101,7 +1118,6 @@ def fetch_current_price():
     if trading_client is not None and HAS_TRADING_LIB:
         try:
             asset = signal_data.get('asset', 'EURUSD_otc')
-            print(f"Fetching price for {asset}...")
             
             # Get the event loop
             if loop is None:
@@ -1110,36 +1126,44 @@ def fetch_current_price():
             
             # Try to get current price
             if hasattr(trading_client, 'get_current_price'):
-                price = loop.run_until_complete(trading_client.get_current_price(asset))
-                if price and price > 0:
-                    print(f"✅ Got price from get_current_price: {price}")
-                    return {'price': price, 'timestamp': time.time()}
+                try:
+                    price = loop.run_until_complete(trading_client.get_current_price(asset))
+                    if price and price > 0:
+                        logger.debug(f"✅ Got price from get_current_price: {price}")
+                        return {'price': price, 'timestamp': time.time()}
+                except Exception as e:
+                    logger.debug(f"get_current_price failed: {e}")
             
             # Try candles as fallback
             if hasattr(trading_client, 'get_candles'):
-                candles = loop.run_until_complete(trading_client.get_candles(asset, 1, 1))
-                if candles and len(candles) > 0:
-                    latest = candles[-1]
-                    price = latest.get('close', 0)
-                    if price > 0:
-                        print(f"✅ Got price from get_candles: {price}")
-                        return {'price': price, 'timestamp': latest.get('time', time.time())}
+                try:
+                    candles = loop.run_until_complete(trading_client.get_candles(asset, 1, 1))
+                    if candles and len(candles) > 0:
+                        latest = candles[-1]
+                        price = latest.get('close', 0)
+                        if price > 0:
+                            logger.debug(f"✅ Got price from get_candles: {price}")
+                            return {'price': price, 'timestamp': latest.get('time', time.time())}
+                except Exception as e:
+                    logger.debug(f"get_candles failed: {e}")
             
             # Try history as fallback
             if hasattr(trading_client, 'history'):
-                history = loop.run_until_complete(trading_client.history(asset, 1))
-                if history and len(history) > 0:
-                    latest = history[-1]
-                    price = latest.get('close', 0)
-                    if price > 0:
-                        print(f"✅ Got price from history: {price}")
-                        return {'price': price, 'timestamp': latest.get('time', time.time())}
+                try:
+                    history = loop.run_until_complete(trading_client.history(asset, 1))
+                    if history and len(history) > 0:
+                        latest = history[-1]
+                        price = latest.get('close', 0)
+                        if price > 0:
+                            logger.debug(f"✅ Got price from history: {price}")
+                            return {'price': price, 'timestamp': latest.get('time', time.time())}
+                except Exception as e:
+                    logger.debug(f"history failed: {e}")
             
-            print("⚠️ All price fetch methods failed, using mock data")
+            logger.warning("⚠️ All price fetch methods failed, using mock data")
             
         except Exception as e:
-            print(f"⚠️ Price fetch error: {e}")
-            traceback.print_exc()
+            logger.warning(f"⚠️ Price fetch error: {e}")
     
     # Fallback to mock data
     return generate_mock_price()
